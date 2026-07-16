@@ -130,9 +130,13 @@ class HestiaClient:
     # Raw command execution
     # ------------------------------------------------------------------
 
-    def exec(self, command: str, timeout: int = 120) -> Tuple[int, str, str]:
+    def exec(self, command: str, timeout: int = 120, warn_on_error: bool = True) -> Tuple[int, str, str]:
         """Execute a command. Uses local subprocess or SSH depending on mode.
         Returns (exit_code, stdout, stderr).
+
+        Args:
+            warn_on_error: If False, non-zero exit codes are NOT logged as warnings
+                           (use for expected failures like `test -f` checking file existence).
         """
         log.debug(f"Exec ({'local' if self.local else 'ssh'}): {command[:120]}...")
 
@@ -160,7 +164,7 @@ class HestiaClient:
             out = stdout.read().decode("utf-8", errors="replace")
             err = stderr.read().decode("utf-8", errors="replace")
 
-        if code != 0:
+        if code != 0 and warn_on_error:
             log.warning(f"Command exited {code}: {command[:100]}")
             if err:
                 log.warning(f"stderr: {err[:300]}")
@@ -341,7 +345,11 @@ class HestiaClient:
     def ssl_exists(self, user: str, domain: str) -> bool:
         """Check if SSL certificates exist for a domain."""
         paths = self.get_ssl_cert_paths(user, domain)
-        exit_code, stdout, _ = self.exec(f"test -f {paths['cert']} && test -f {paths['key']} && echo OK")
+        # warn_on_error=False: file not found is expected, not an error
+        exit_code, stdout, _ = self.exec(
+            f"test -f {paths['cert']} && test -f {paths['key']} && echo OK",
+            warn_on_error=False,
+        )
         return exit_code == 0 and "OK" in stdout
 
     def read_ssl_cert(self, user: str, domain: str) -> Dict[str, str]:

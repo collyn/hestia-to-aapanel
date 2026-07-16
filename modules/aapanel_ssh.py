@@ -117,9 +117,12 @@ class AAPanelSSH:
     # Raw execution
     # ------------------------------------------------------------------
 
-    def exec(self, command: str, timeout: int = 120) -> Tuple[int, str, str]:
+    def exec(self, command: str, timeout: int = 120, warn_on_error: bool = True) -> Tuple[int, str, str]:
         """Execute command. Uses local subprocess or SSH depending on mode.
         Returns (exit_code, stdout, stderr).
+
+        Args:
+            warn_on_error: If False, non-zero exit codes are NOT logged as warnings.
         """
         log.debug(f"Exec ({'local' if self.local else 'ssh'}): {command[:120]}...")
 
@@ -146,6 +149,11 @@ class AAPanelSSH:
             code = stdout.channel.recv_exit_status()
             out = stdout.read().decode("utf-8", errors="replace")
             err = stderr.read().decode("utf-8", errors="replace")
+
+        if code != 0 and warn_on_error:
+            log.warning(f"Command exited {code}: {command[:100]}")
+            if err:
+                log.warning(f"stderr: {err[:300]}")
 
         return code, out, err
 
