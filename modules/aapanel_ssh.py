@@ -167,7 +167,7 @@ class AAPanelSSH:
 
     def file_exists(self, path: str) -> bool:
         """Check if a file exists on the server."""
-        exit_code, _, _ = self.exec(f"test -e {path}")
+        exit_code, _, _ = self.exec(f"test -e {path}", warn_on_error=False)
         return exit_code == 0
 
     def create_web_root(self, domain: str) -> str:
@@ -284,8 +284,8 @@ class AAPanelSSH:
         if not entries:
             return True
 
-        # Get existing crontab
-        exit_code, existing, _ = self.exec("crontab -l 2>/dev/null")
+        # Get existing crontab (may fail if no crontab exists yet)
+        exit_code, existing, _ = self.exec("crontab -l 2>/dev/null", warn_on_error=False)
         if exit_code != 0:
             existing = ""
 

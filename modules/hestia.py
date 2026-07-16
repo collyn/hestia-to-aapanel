@@ -275,7 +275,7 @@ class HestiaClient:
     def get_mysql_admin_credentials(self) -> Dict[str, str]:
         """Read MySQL admin credentials from HestiaCP config."""
         mysql_conf = "/usr/local/hestia/conf/mysql.conf"
-        exit_code, content, _ = self.exec(f"cat {mysql_conf}")
+        exit_code, content, _ = self.exec(f"cat {mysql_conf}", warn_on_error=False)
         if exit_code != 0:
             log.error("Cannot read MySQL config")
             return {}
@@ -308,7 +308,7 @@ class HestiaClient:
 
         # Method 2: Check PHP-FPM socket
         php_conf = f"/home/{user}/conf/web/{domain}/php-fpm.conf"
-        exit_code, content, _ = self.exec(f"cat {php_conf} 2>/dev/null")
+        exit_code, content, _ = self.exec(f"cat {php_conf} 2>/dev/null", warn_on_error=False)
         if exit_code == 0:
             match = re.search(r"php(\d+)\.(\d+)-fpm", content)
             if match:
@@ -319,7 +319,7 @@ class HestiaClient:
                 return f"{match.group(1)}{match.group(2)}"
 
         # Method 3: Check running PHP-FPM version
-        exit_code, content, _ = self.exec("php -r 'echo PHP_VERSION;' 2>/dev/null")
+        exit_code, content, _ = self.exec("php -r 'echo PHP_VERSION;' 2>/dev/null", warn_on_error=False)
         if exit_code == 0 and content:
             parts = content.split(".")
             if len(parts) >= 2:
@@ -357,7 +357,7 @@ class HestiaClient:
         paths = self.get_ssl_cert_paths(user, domain)
         result = {}
         for name, path in paths.items():
-            exit_code, content, _ = self.exec(f"cat {path} 2>/dev/null")
+            exit_code, content, _ = self.exec(f"cat {path} 2>/dev/null", warn_on_error=False)
             if exit_code == 0 and content:
                 result[name] = content
         return result
