@@ -374,6 +374,30 @@ class HestiaClient:
     # Database dump
     # ------------------------------------------------------------------
 
+    def find_existing_dump(self, db_name: str) -> Optional[str]:
+        """Check if a dump file already exists for this database.
+
+        Returns the path to the existing dump, or None.
+        """
+        exit_code, stdout, _ = self.exec(
+            f"ls -t {self.tmp_dir}/{db_name}_*.sql 2>/dev/null | head -1",
+            warn_on_error=False,
+        )
+        path = stdout.strip() if stdout else ""
+        if path and exit_code == 0:
+            # Verify it's not empty
+            check_code, size_str, _ = self.exec(
+                f"stat -c%s {path} 2>/dev/null || wc -c < {path}",
+                warn_on_error=False,
+            )
+            try:
+                if int(size_str.strip() or 0) > 0:
+                    log.info(f"Reusing existing dump: {path} ({size_str.strip()} bytes)")
+                    return path
+            except ValueError:
+                pass
+        return None
+
     def dump_database(
         self,
         db_name: str,
@@ -440,6 +464,26 @@ class HestiaClient:
 
         log.info(f"Dumped database: {db_name} → {remote_path} ({file_size} bytes)")
         return remote_path, filename
+
+    def find_existing_archive(self, domain: str) -> Optional[str]:
+        """Check if a web archive already exists for this domain."""
+        exit_code, stdout, _ = self.exec(
+            f"ls -t {self.tmp_dir}/{domain}_*.tar.gz 2>/dev/null | head -1",
+            warn_on_error=False,
+        )
+        path = stdout.strip() if stdout else ""
+        if path and exit_code == 0:
+            check_code, size_str, _ = self.exec(
+                f"stat -c%s {path} 2>/dev/null || wc -c < {path}",
+                warn_on_error=False,
+            )
+            try:
+                if int(size_str.strip() or 0) > 0:
+                    log.info(f"Reusing existing archive: {path} ({size_str.strip()} bytes)")
+                    return path
+            except ValueError:
+                pass
+        return None
 
     # ------------------------------------------------------------------
     # Web files archive

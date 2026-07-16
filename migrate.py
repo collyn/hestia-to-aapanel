@@ -291,8 +291,13 @@ class HestiaToAAPanelMigrator:
                 )
                 for db_name, user in unique_dbs.items():
                     try:
-                        dump_path, filename = self.hestia.dump_database(db_name)
-                        db_dump_map[db_name] = dump_path
+                        # Check if dump already exists (from previous run / resume)
+                        existing = self.hestia.find_existing_dump(db_name)
+                        if existing:
+                            db_dump_map[db_name] = existing
+                        else:
+                            dump_path, filename = self.hestia.dump_database(db_name)
+                            db_dump_map[db_name] = dump_path
                         progress.advance(db_task)
                     except Exception as e:
                         log.error(f"Failed to dump database '{db_name}' (user={user}): {e}")
@@ -312,8 +317,12 @@ class HestiaToAAPanelMigrator:
                     entry: Dict[str, Any] = {"domain": domain}
 
                     try:
-                        archive_path, _ = self.hestia.archive_web_files(user, domain)
-                        entry["hestia_archive_path"] = archive_path
+                        existing = self.hestia.find_existing_archive(domain)
+                        if existing:
+                            entry["hestia_archive_path"] = existing
+                        else:
+                            archive_path, _ = self.hestia.archive_web_files(user, domain)
+                            entry["hestia_archive_path"] = archive_path
                     except Exception as e:
                         log.error(f"Failed to archive {domain}: {e}")
                         entry["hestia_archive_path"] = None
