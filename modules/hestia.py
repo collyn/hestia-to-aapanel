@@ -624,32 +624,69 @@ class HestiaClient:
     # Full site extraction
     # ------------------------------------------------------------------
 
-    def extract_all(self) -> List[Dict[str, Any]]:
-        """Extract complete data for all websites.
+    def extract_all(self, max_workers: int = 8) -> List[Dict[str, Any]]:
+        """Extract complete data for all websites (parallel).
 
-        Returns a list of site data dicts ready for migration.
+        Uses multiple SSH connections to extract domains concurrently.
+
+        Args:
+            max_workers: Number of parallel SSH connections for extraction.
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         users = self.get_users()
         log.info(f"Found {len(users)} HestiaCP users: {users}")
 
-        all_sites: List[Dict[str, Any]] = []
-
+        # Build flat list of (user, domain) pairs
+        all_domains: List[Tuple[str, str]] = []
         for user in users:
             domains = self.get_web_domains(user)
             log.info(f"User '{user}': {len(domains)} domains")
-
             for domain in domains:
+                all_domains.append((user, domain))
+
+        log.info(f"Total: {len(all_domains)} domains to extract (parallel={max_workers})")
+
+        if max_workers <= 1:
+            # Sequential mode
+            all_sites = []
+            for user, domain in all_domains:
                 try:
-                    site_data = self._extract_site(user, domain)
-                    all_sites.append(site_data)
+                    all_sites.append(self._extract_site(user, domain))
                 except Exception as e:
                     log.error(f"Failed to extract {user}/{domain}: {e}")
-                    all_sites.append({
-                        "user": user,
-                        "domain": domain,
-                        "error": str(e),
-                        "status": "extraction_failed",
-                    })
+                    all_sites.append({"user": user, "domain": domain, "error": str(e), "status": "extraction_failed"})
+            return all_sites
+
+        # Parallel mode: each thread gets its own SSH connection
+        from .utils import create_progress
+        all_sites = []
+
+        def _extract_one(user_domain: Tuple[str, str]) -> Dict[str, Any]:
+            user, domain = user_domain
+            # Create a fresh SSH connection for this thread
+            client = HestiaClient(
+                host=self.host, port=self.port, user=self.user,
+                password=self.password, ssh_key=str(self.ssh_key) if self.ssh_key else None,
+                hestia_path=str(self.hestia_path), tmp_dir=self.tmp_dir,
+                local=self.local,
+            )
+            try:
+                client.connect()
+                return client._extract_site(user, domain)
+            except Exception as e:
+                log.error(f"Failed to extract {user}/{domain}: {e}")
+                return {"user": user, "domain": domain, "error": str(e), "status": "extraction_failed"}
+            finally:
+                client.disconnect()
+
+        with create_progress() as progress:
+            task = progress.add_task("[cyan]Extracting sites...", total=len(all_domains))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(_extract_one, d): d for d in all_domains}
+                for future in as_completed(futures):
+                    all_sites.append(future.result())
+                    progress.advance(task)
 
         log.info(f"Extracted {len(all_sites)} sites total")
         return all_sites

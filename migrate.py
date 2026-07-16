@@ -212,7 +212,8 @@ class HestiaToAAPanelMigrator:
 
         self.hestia.connect()
         try:
-            sites = self.hestia.extract_all()
+            workers = self.config.get("migration", {}).get("parallel_workers", 8)
+            sites = self.hestia.extract_all(max_workers=workers)
         finally:
             self.hestia.disconnect()
 
