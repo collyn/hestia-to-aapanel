@@ -609,16 +609,20 @@ class HestiaToAAPanelMigrator:
                 if dbs:
                     db_info = dbs[0]
                     db_name = db_info.get("DATABASE", db_info.get("database", ""))
-                    # Upload dump
-                    remote_dump = f"{self.ssh.tmp_dir}/{os.path.basename(db_dump_path)}"
-                    self.ssh.ensure_dir(self.ssh.tmp_dir)
-                    ok, _ = self.transfer_mgr.transfer(
-                        db_dump_path, remote_dump,
-                        direction="upload",
-                        local=self.config.get("aapanel", {}).get("local", False),
-                    )
-                    if ok:
-                        self.ssh.import_mysql_dump(remote_dump, db_name)
+                    if aapanel_local:
+                        # Already on aaPanel → import directly from local path
+                        self.ssh.import_mysql_dump(db_dump_path, db_name)
+                    else:
+                        # Remote aaPanel → upload dump first, then import
+                        remote_dump = f"{self.ssh.tmp_dir}/{os.path.basename(db_dump_path)}"
+                        self.ssh.ensure_dir(self.ssh.tmp_dir)
+                        ok, _ = self.transfer_mgr.transfer(
+                            db_dump_path, remote_dump,
+                            direction="upload",
+                            local=False,
+                        )
+                        if ok:
+                            self.ssh.import_mysql_dump(remote_dump, db_name)
             finally:
                 self.ssh.disconnect()
 

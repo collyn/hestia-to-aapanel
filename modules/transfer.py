@@ -163,6 +163,11 @@ class TransferManager:
 
         When local=True, uses cp instead of SCP (running on that server).
         """
+        # Skip if local file already exists (from previous run / resume)
+        if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+            log.info(f"Skipping transfer, already exists: {os.path.basename(local_path)} ({os.path.getsize(local_path)} bytes)")
+            return True, ""
+
         # Ensure local directory exists
         local_dir = os.path.dirname(local_path)
         if local_dir:
