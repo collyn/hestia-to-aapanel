@@ -381,7 +381,10 @@ class HestiaClient:
     ) -> Tuple[str, str]:
         """Dump a MySQL database using mysqldump.
 
-        Returns (local_dump_path, dump_filename).
+        Returns (remote_dump_path, dump_filename).
+
+        Uses --defaults-extra-file to avoid password-in-command-line warnings
+        and shell escaping issues with special characters.
         """
         creds = self.get_mysql_admin_credentials()
         db_user = creds.get("user", "root")
@@ -393,18 +396,49 @@ class HestiaClient:
         # Create tmp dir if not exists
         self.exec(f"mkdir -p {self.tmp_dir}")
 
+        # Use mysql config file approach to avoid password-in-command warnings
+        # and shell escaping issues
+        my_cnf = f"{self.tmp_dir}/.my.cnf"
+        self.exec(
+            f"printf '[client]\\nuser={db_user}\\npassword=\"{db_pass}\"\\n' > {my_cnf} && chmod 600 {my_cnf}"
+        )
+
         dump_cmd = (
-            f"mysqldump -u{db_user} -p'{db_pass}' "
+            f"mysqldump --defaults-extra-file={my_cnf} "
             f"--single-transaction --routines --triggers "
             f"--add-drop-table --extended-insert "
-            f"{db_name} > {remote_path}"
+            f"--no-tablespaces "
+            f"{db_name} > {remote_path} 2>/dev/null"
         )
 
         exit_code, stdout, stderr = self.exec(dump_cmd, timeout=600)
+
+        # Clean up temp my.cnf
+        self.exec(f"rm -f {my_cnf}", warn_on_error=False)
+
         if exit_code != 0:
             raise RuntimeError(f"mysqldump failed for {db_name}: {stderr}")
 
-        log.info(f"Dumped database: {db_name} → {remote_path}")
+        # Verify dump file is not empty
+        check_code, size_str, _ = self.exec(
+            f"stat -c%s {remote_path} 2>/dev/null || wc -c < {remote_path}",
+            warn_on_error=False,
+        )
+        try:
+            file_size = int(size_str.strip()) if size_str else 0
+        except ValueError:
+            file_size = 0
+
+        if file_size == 0:
+            raise RuntimeError(
+                f"mysqldump produced empty file for {db_name}. "
+                f"Database may not exist or is empty."
+            )
+        if file_size < 100:
+            # Very small dump — might just be a "no tables" DB
+            log.warning(f"Database {db_name} dump is very small ({file_size} bytes)")
+
+        log.info(f"Dumped database: {db_name} → {remote_path} ({file_size} bytes)")
         return remote_path, filename
 
     # ------------------------------------------------------------------

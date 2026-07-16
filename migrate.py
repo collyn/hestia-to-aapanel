@@ -214,18 +214,58 @@ class HestiaToAAPanelMigrator:
     # ------------------------------------------------------------------
 
     def phase_transfer(self, sites: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-        """Transfer web files and database dumps from HestiaCP to local."""
+        """Transfer web files and database dumps from HestiaCP to local.
+
+        Databases are deduplicated: each unique database is dumped exactly once,
+        even if referenced by multiple sites belonging to the same user.
+        """
         console.print("\n[bold cyan]Phase 2: Transferring files and databases...[/bold cyan]")
 
         if self.dry_run:
             console.print("[yellow]DRY RUN: Skipping actual transfers[/yellow]")
             return {}
 
-        # Reconnect Hestia for dump + archive creation
+        do_databases = self.config.get("migration", {}).get("databases", True)
+
+        # ---- Step 0: Collect unique databases across all sites ----
+        unique_dbs: Dict[str, str] = {}  # db_name → user
+        if do_databases:
+            for site in sites:
+                for db in site.get("databases", []):
+                    db_name = db.get("DATABASE", db.get("database", ""))
+                    if db_name and db_name not in unique_dbs:
+                        unique_dbs[db_name] = site["user"]
+
+        if unique_dbs:
+            console.print(f"Found [cyan]{len(unique_dbs)} unique databases[/cyan] to dump")
+
+        # ---- Step 1: Create archives + dump databases on HestiaCP ----
         self.hestia.connect()
 
+        # Dump each unique database ONCE
+        db_dump_map: Dict[str, str] = {}  # db_name → remote_dump_path
+        if unique_dbs:
+            console.print("Dumping databases (deduplicated)...")
+            with create_progress() as progress:
+                db_task = progress.add_task(
+                    "[cyan]Dumping databases...", total=len(unique_dbs)
+                )
+                for db_name, user in unique_dbs.items():
+                    try:
+                        dump_path, filename = self.hestia.dump_database(db_name)
+                        db_dump_map[db_name] = dump_path
+                        progress.advance(db_task)
+                    except Exception as e:
+                        log.error(f"Failed to dump database '{db_name}' (user={user}): {e}")
+                        progress.advance(db_task)
+
+        # Archive each site's web files
         transfers = []
-        try:
+        console.print(f"\nArchiving web files for {len(sites)} sites...")
+        with create_progress() as progress:
+            site_task = progress.add_task(
+                "[cyan]Archiving sites...", total=len(sites)
+            )
             for site in sites:
                 domain = site["domain"]
                 user = site["user"]
@@ -239,31 +279,36 @@ class HestiaToAAPanelMigrator:
                     log.error(f"Failed to archive {domain}: {e}")
                     entry["hestia_archive_path"] = None
 
-                # Dump databases
+                # Reference already-dumped databases (no re-dumping!)
                 dbs = site.get("databases", [])
-                if dbs and self.config.get("migration", {}).get("databases", True):
+                if dbs and do_databases:
                     db_dumps = []
                     for db in dbs:
                         db_name = db.get("DATABASE", db.get("database", ""))
-                        if not db_name:
-                            continue
-                        try:
-                            dump_path, _ = self.hestia.dump_database(db_name)
-                            db_dumps.append({"db_name": db_name, "dump_path": dump_path})
-                        except Exception as e:
-                            log.error(f"Failed to dump {db_name}: {e}")
+                        if db_name and db_name in db_dump_map:
+                            db_dumps.append({
+                                "db_name": db_name,
+                                "dump_path": db_dump_map[db_name],
+                            })
                     if db_dumps:
                         entry["hestia_db_dump_path"] = db_dumps[0]["dump_path"]
                         entry["_db_dumps"] = db_dumps
 
                 transfers.append(entry)
-        finally:
-            self.hestia.disconnect()
+                progress.advance(site_task)
 
-        # Now transfer files locally
+        self.hestia.disconnect()
+
+        # ---- Step 2: Transfer files to local machine ----
+        console.print(f"\nTransferring {len(transfers)} site archives + {len(db_dump_map)} db dumps...")
         results = self.transfer_mgr.transfer_sites_batch(
             transfers, str(self.local_tmp)
         )
+
+        # Also transfer the unique database dumps that aren't tied to any single site
+        if db_dump_map:
+            # Store the db dump mapping in state for phase_import to use
+            self._db_dump_map = db_dump_map
 
         self.state.data["current_phase"] = "transfer_done"
         self.state.save()
