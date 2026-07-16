@@ -217,7 +217,21 @@ class HestiaToAAPanelMigrator:
         finally:
             self.hestia.disconnect()
 
-        # Apply exclusions
+        # Apply filters: only_domains (whitelist) takes priority over exclude
+        only_domains = self.config.get("migration", {}).get("only_domains", [])
+        only_domains_file = self.config.get("migration", {}).get("only_domains_file", "")
+
+        # Load domains from file if specified
+        if only_domains_file:
+            file_path = Path(only_domains_file)
+            if file_path.exists():
+                with open(file_path) as f:
+                    file_domains = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+                only_domains = list(set(only_domains + file_domains))
+                console.print(f"[cyan]Loaded {len(file_domains)} domains from {only_domains_file}[/cyan]")
+            else:
+                log.error(f"Domains file not found: {only_domains_file}")
+
         exclude_domains = set(
             self.config.get("migration", {}).get("exclude_domains", [])
         )
@@ -225,11 +239,16 @@ class HestiaToAAPanelMigrator:
             self.config.get("migration", {}).get("exclude_users", [])
         )
 
-        sites = [
-            s for s in sites
-            if s.get("domain") not in exclude_domains
-            and s.get("user") not in exclude_users
-        ]
+        if only_domains:
+            only_set = set(only_domains)
+            sites = [s for s in sites if s.get("domain") in only_set]
+            console.print(f"[cyan]Filtered to {len(sites)} domains[/cyan]")
+        else:
+            sites = [
+                s for s in sites
+                if s.get("domain") not in exclude_domains
+                and s.get("user") not in exclude_users
+            ]
 
         # Filter out failed extractions
         failed = [s for s in sites if s.get("status") == "extraction_failed"]

@@ -47,6 +47,10 @@ logging.basicConfig(
 
 log = logging.getLogger("hestia2aa")
 
+# Suppress noisy paramiko transport logs (SSH connect/disconnect/sftp)
+logging.getLogger("paramiko.transport").setLevel(logging.WARNING)
+logging.getLogger("paramiko.transport.sftp").setLevel(logging.WARNING)
+
 
 def get_state_path() -> Path:
     """Return path to the migration state file."""

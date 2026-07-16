@@ -76,7 +76,7 @@ class HestiaClient:
                     "Are you sure this is a HestiaCP server? "
                     "Set hestia.local=false to use remote SSH."
                 )
-            log.info(f"Local mode: using HestiaCP at {self.hestia_path}")
+            log.debug(f"Local mode: using HestiaCP at {self.hestia_path}")
             return
 
         if not HAS_PARAMIKO:
@@ -102,7 +102,7 @@ class HestiaClient:
         try:
             self._client.connect(**connect_kwargs)
             self._sftp = self._client.open_sftp()
-            log.info(f"Connected to HestiaCP server: {self.host}:{self.port}")
+            log.debug(f"Connected to HestiaCP server: {self.host}:{self.port}")
         except Exception as e:
             log.error(f"Failed to connect to HestiaCP server: {e}")
             raise
@@ -115,7 +115,7 @@ class HestiaClient:
             self._sftp.close()
         if self._client:
             self._client.close()
-        log.info("Disconnected from HestiaCP server")
+        log.debug("Disconnected from HestiaCP server")
 
     def __enter__(self):
         self.connect()
@@ -693,7 +693,7 @@ class HestiaClient:
 
     def _extract_site(self, user: str, domain: str) -> Dict[str, Any]:
         """Extract all data for one site."""
-        log.info(f"Extracting: {user} / {domain}")
+        log.debug(f"Extracting: {user} / {domain}")
 
         domain_detail = self.get_web_domain_detail(user, domain)
         php_version = self.detect_php_version(user, domain)

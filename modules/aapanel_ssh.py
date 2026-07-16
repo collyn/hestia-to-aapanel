@@ -72,7 +72,7 @@ class AAPanelSSH:
                     "Are you sure this is an aaPanel server? "
                     "Set aapanel.local=false to use remote SSH."
                 )
-            log.info("Local mode: running on aaPanel server")
+            log.debug("Local mode: running on aaPanel server")
             return
 
         if not HAS_PARAMIKO:

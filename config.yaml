@@ -60,7 +60,15 @@ migration:
   # Site name prefix/suffix for aaPanel (optional)
   # site_name_prefix: "migrated_"
 
-  # Exclude specific domains/users from migration
+  # Migrate ONLY these domains (whitelist — all others are skipped)
+  # Can specify inline list, a .txt file (one domain per line), or both.
+  # Leave empty to migrate all domains.
+  # only_domains:
+  #   - "mysite.com"
+  #   - "anothersite.vn"
+  only_domains_file: ""            # Path to .txt file (one domain per line, # comments OK)
+
+  # Exclude specific domains/users from migration (ignored if only_domains is set)
   # exclude_domains:
   #   - "test.example.com"
   # exclude_users:
