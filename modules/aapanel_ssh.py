@@ -183,6 +183,44 @@ class AAPanelSSH:
     # Database management
     # ------------------------------------------------------------------
 
+    def _mysql_cmd(self) -> str:
+        """Build a working mysql CLI command, trying multiple auth methods.
+
+        Returns a prefix like 'mysql' or 'mysql -uroot -pXXX' that works.
+        """
+        # Method 1: Try mysql without password (socket auth / root via sudo)
+        _, _, _ = self.exec("mysql -e 'SELECT 1' 2>/dev/null", warn_on_error=False)
+
+        # Method 2: Try with debian-sys-maint (Debian/Ubuntu default)
+        debian_cnf = "/etc/mysql/debian.cnf"
+        code, _, _ = self.exec(
+            f"test -f {debian_cnf} && mysql --defaults-file={debian_cnf} -e 'SELECT 1' 2>/dev/null",
+            warn_on_error=False,
+        )
+        if code == 0:
+            return f"mysql --defaults-file={debian_cnf}"
+
+        # Method 3: Try to read root password from common aaPanel locations
+        for pw_file in [
+            "/www/server/panel/data/default.db",  # aaPanel SQLite
+            "/root/.my.cnf",
+        ]:
+            code, content, _ = self.exec(
+                f"cat {pw_file} 2>/dev/null | grep -oP 'password[\"\\s=]+\\K[^\"\\s]+' | head -1",
+                warn_on_error=False,
+            )
+            if code == 0 and content.strip():
+                pw = content.strip()
+                return f"mysql -uroot -p'{pw}'"
+
+        # Method 4: Try mysql via sudo
+        code, _, _ = self.exec("sudo mysql -e 'SELECT 1' 2>/dev/null", warn_on_error=False)
+        if code == 0:
+            return "sudo mysql"
+
+        # Fallback: just mysql (may work with ~/.my.cnf or socket auth)
+        return "mysql"
+
     def create_mysql_database(
         self,
         db_name: str,
@@ -192,27 +230,41 @@ class AAPanelSSH:
     ) -> bool:
         """Create a MySQL database and user directly (fallback when API fails).
 
-        Executes raw SQL to create DB + user + grant privileges.
+        Uses a temp SQL file to avoid shell escaping issues with backticks.
         """
-        # Escape special chars for SQL
-        safe_db = db_name.replace("`", "``")
-        safe_user = db_user.replace("'", "\\'")
-        safe_pass = db_password.replace("'", "\\'")
+        mysql_bin = self._mysql_cmd()
 
+        # Normalize charset for COLLATE (utf8mb4 → utf8mb4, UTF8 → utf8)
+        cs = charset.lower().replace("utf8mb4", "utf8mb4").replace("utf8", "utf8")
+        if cs not in ("utf8", "utf8mb4", "latin1", "gbk", "big5"):
+            cs = "utf8mb4"
+
+        # Build SQL file (avoids shell escaping of backticks and quotes)
         sql = (
-            f"CREATE DATABASE IF NOT EXISTS `{safe_db}` "
-            f"DEFAULT CHARACTER SET {charset} COLLATE {charset}_unicode_ci; "
-            f"CREATE USER IF NOT EXISTS '{safe_user}'@'%' IDENTIFIED BY '{safe_pass}'; "
-            f"GRANT ALL PRIVILEGES ON `{safe_db}`.* TO '{safe_user}'@'%'; "
-            f"CREATE USER IF NOT EXISTS '{safe_user}'@'localhost' IDENTIFIED BY '{safe_pass}'; "
-            f"GRANT ALL PRIVILEGES ON `{safe_db}`.* TO '{safe_user}'@'localhost'; "
-            f"FLUSH PRIVILEGES;"
+            f"CREATE DATABASE IF NOT EXISTS `{db_name}` "
+            f"DEFAULT CHARACTER SET {cs} COLLATE {cs}_unicode_ci;\n"
+            f"CREATE USER IF NOT EXISTS '{db_user}'@'%' IDENTIFIED BY '{db_password}';\n"
+            f"GRANT ALL PRIVILEGES ON `{db_name}`.* TO '{db_user}'@'%';\n"
+            f"GRANT ALL PRIVILEGES ON `{db_name}`.* TO '{db_user}'@'localhost';\n"
+            f"FLUSH PRIVILEGES;\n"
         )
 
-        cmd = f"mysql -e \"{sql}\""
+        sql_file = f"{self.tmp_dir}/create_db_{db_name}.sql"
+        self.ensure_dir(self.tmp_dir)
+
+        if self.local:
+            with open(sql_file, "w") as f:
+                f.write(sql)
+        else:
+            with self._sftp.open(sql_file, "w") as f:
+                f.write(sql)
+
+        cmd = f"{mysql_bin} < {sql_file}"
         exit_code, stdout, stderr = self.exec(cmd, timeout=30)
+        self.exec(f"rm -f {sql_file}", warn_on_error=False)
+
         if exit_code != 0:
-            raise RuntimeError(f"MySQL create DB failed: {stderr}")
+            raise RuntimeError(f"MySQL create DB failed (auth={mysql_bin}): {stderr}")
 
         log.info(f"Created MySQL DB: {db_name} (user={db_user})")
         return True
@@ -224,18 +276,20 @@ class AAPanelSSH:
     def import_mysql_dump(self, dump_path: str, db_name: str) -> bool:
         """Import a MySQL dump file into a database.
 
-        Uses mysql command. The database must already exist in aaPanel.
+        Uses the same auth detection as create_mysql_database.
+        The database must already exist.
         """
         if not self.file_exists(dump_path):
             log.error(f"Dump file not found: {dump_path}")
             return False
 
-        # Try mysql with root credentials
-        cmd = f"mysql {db_name} < {dump_path} 2>&1"
+        mysql_bin = self._mysql_cmd()
+        cmd = f"{mysql_bin} {db_name} < {dump_path}"
         exit_code, stdout, stderr = self.exec(cmd, timeout=600)
 
         if exit_code != 0:
             log.error(f"MySQL import failed for {db_name}: {stderr}")
+            log.error(f"Auth method used: {mysql_bin}")
             return False
 
         log.info(f"Imported MySQL dump into: {db_name}")
