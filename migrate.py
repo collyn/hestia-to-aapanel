@@ -113,17 +113,19 @@ class HestiaToAAPanelMigrator:
         )
 
         # aaPanel API client
-        # Auto-detect panel URL for local mode
         panel_url = aapanel_cfg["panel_url"]
         if aapanel_local:
-            panel_url = panel_url.replace("127.0.0.1", "localhost")
-            if "localhost" not in panel_url and "127.0.0.1" not in panel_url:
-                console.print(
-                    f"[yellow]Local mode: overriding panel_url to http://127.0.0.1:8888[/yellow]"
-                    f"[yellow] (was {panel_url})[/yellow]"
-                )
-                # Try to detect the actual port
-                panel_url = "http://127.0.0.1:8888"
+            # Only override to localhost if user didn't already set a local URL
+            if "127.0.0.1" in panel_url or "localhost" in panel_url:
+                pass  # User already configured local URL — keep it
+            else:
+                # User configured a remote URL but we're local — try to use localhost
+                # with the same port from the user's config
+                from urllib.parse import urlparse
+                parsed = urlparse(panel_url)
+                port = parsed.port or 8888
+                panel_url = f"http://127.0.0.1:{port}"
+                console.print(f"[cyan]Local mode: using {panel_url} (from your config port {port})[/cyan]")
 
         self.api = AAPanelAPI(
             panel_url=panel_url,
@@ -163,6 +165,42 @@ class HestiaToAAPanelMigrator:
             domain_map=migration_cfg.get("domain_map"),
             default_quota=self.config.get("mail", {}).get("default_quota", "5 GB"),
         )
+
+    # ------------------------------------------------------------------
+    # Sites cache (avoid re-extracting on resume)
+    # ------------------------------------------------------------------
+
+    def _sites_cache_path(self) -> Path:
+        return Path(__file__).resolve().parent / "sites_cache.json"
+
+    def _load_sites_cache(self) -> Optional[List[Dict[str, Any]]]:
+        """Load previously extracted sites from cache file."""
+        path = self._sites_cache_path()
+        if not path.exists():
+            return None
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            # Validate it's not empty and has the right structure
+            if isinstance(data, list) and len(data) > 0 and "domain" in data[0]:
+                log.info(f"Loaded {len(data)} sites from cache")
+                return data
+        except (json.JSONDecodeError, KeyError):
+            log.warning("Corrupted sites cache, ignoring")
+        return None
+
+    def _save_sites_cache(self, sites: List[Dict[str, Any]]):
+        """Save extracted sites to cache file (without SSL cert content — too large)."""
+        # Strip large binary fields before caching
+        cache_data = []
+        for s in sites:
+            entry = {k: v for k, v in s.items() if k != "ssl_certs"}
+            cache_data.append(entry)
+
+        path = self._sites_cache_path()
+        with open(path, "w") as f:
+            json.dump(cache_data, f, indent=2, default=str)
+        log.info(f"Saved {len(cache_data)} sites to cache: {path}")
 
     # ------------------------------------------------------------------
     # Phase 1: Extract
@@ -780,11 +818,17 @@ class HestiaToAAPanelMigrator:
         self.setup()
 
         try:
-            # Phase 1: Extract
-            sites = self.phase_extract()
-            if not sites:
-                console.print("[yellow]No sites to migrate[/yellow]")
-                return
+            # Phase 1: Extract (cached — skip on resume if already done)
+            sites_cache = self._load_sites_cache()
+            if resume and sites_cache:
+                sites = sites_cache
+                console.print(f"[green]Loaded {len(sites)} sites from cache (skipping Phase 1)[/green]")
+            else:
+                sites = self.phase_extract()
+                self._save_sites_cache(sites)
+                if not sites:
+                    console.print("[yellow]No sites to migrate[/yellow]")
+                    return
 
             # Show preview
             console.print("\n[bold]Sites to migrate:[/bold]")
