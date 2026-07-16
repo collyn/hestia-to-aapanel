@@ -226,6 +226,7 @@ class HestiaToAAPanelMigrator:
             return {}
 
         do_databases = self.config.get("migration", {}).get("databases", True)
+        aapanel_local = self.config.get("aapanel", {}).get("local", False)
 
         # ---- Step 0: Collect unique databases across all sites ----
         unique_dbs: Dict[str, str] = {}  # db_name → user
@@ -259,27 +260,50 @@ class HestiaToAAPanelMigrator:
                         log.error(f"Failed to dump database '{db_name}' (user={user}): {e}")
                         progress.advance(db_task)
 
-        # Archive each site's web files
+        # Archive web files (skip if running on aaPanel — Phase 3 uses direct rsync)
         transfers = []
-        console.print(f"\nArchiving web files for {len(sites)} sites...")
-        with create_progress() as progress:
-            site_task = progress.add_task(
-                "[cyan]Archiving sites...", total=len(sites)
-            )
+        if not aapanel_local:
+            console.print(f"\nArchiving web files for {len(sites)} sites...")
+            with create_progress() as progress:
+                site_task = progress.add_task(
+                    "[cyan]Archiving sites...", total=len(sites)
+                )
+                for site in sites:
+                    domain = site["domain"]
+                    user = site["user"]
+                    entry: Dict[str, Any] = {"domain": domain}
+
+                    try:
+                        archive_path, _ = self.hestia.archive_web_files(user, domain)
+                        entry["hestia_archive_path"] = archive_path
+                    except Exception as e:
+                        log.error(f"Failed to archive {domain}: {e}")
+                        entry["hestia_archive_path"] = None
+
+                    # Reference already-dumped databases
+                    dbs = site.get("databases", [])
+                    if dbs and do_databases:
+                        db_dumps = []
+                        for db in dbs:
+                            db_name = db.get("DATABASE", db.get("database", ""))
+                            if db_name and db_name in db_dump_map:
+                                db_dumps.append({
+                                    "db_name": db_name,
+                                    "dump_path": db_dump_map[db_name],
+                                })
+                        if db_dumps:
+                            entry["hestia_db_dump_path"] = db_dumps[0]["dump_path"]
+                            entry["_db_dumps"] = db_dumps
+
+                    transfers.append(entry)
+                    progress.advance(site_task)
+        else:
+            # On aaPanel: skip archiving, create lightweight transfer entries
+            console.print("[cyan]Skipping web archives (will rsync directly in Phase 3)[/cyan]")
             for site in sites:
                 domain = site["domain"]
-                user = site["user"]
-                entry: Dict[str, Any] = {"domain": domain}
+                entry: Dict[str, Any] = {"domain": domain, "hestia_archive_path": None}
 
-                # Archive web files
-                try:
-                    archive_path, _ = self.hestia.archive_web_files(user, domain)
-                    entry["hestia_archive_path"] = archive_path
-                except Exception as e:
-                    log.error(f"Failed to archive {domain}: {e}")
-                    entry["hestia_archive_path"] = None
-
-                # Reference already-dumped databases (no re-dumping!)
                 dbs = site.get("databases", [])
                 if dbs and do_databases:
                     db_dumps = []
@@ -295,20 +319,22 @@ class HestiaToAAPanelMigrator:
                         entry["_db_dumps"] = db_dumps
 
                 transfers.append(entry)
-                progress.advance(site_task)
 
         self.hestia.disconnect()
 
-        # ---- Step 2: Transfer files to local machine ----
-        console.print(f"\nTransferring {len(transfers)} site archives + {len(db_dump_map)} db dumps...")
+        # ---- Step 2: Transfer DB dumps to local machine ----
+        if aapanel_local:
+            console.print(f"\nSkipping archive transfer (direct rsync in Phase 3)")
+            console.print(f"Transferring {len(db_dump_map)} database dumps only...")
+        else:
+            console.print(f"\nTransferring {len(transfers)} site archives + {len(db_dump_map)} db dumps...")
+
         results = self.transfer_mgr.transfer_sites_batch(
             transfers, str(self.local_tmp)
         )
 
-        # Also transfer the unique database dumps that aren't tied to any single site
-        if db_dump_map:
-            # Store the db dump mapping in state for phase_import to use
-            self._db_dump_map = db_dump_map
+        # Store the db dump mapping for phase_import to use
+        self._db_dump_map = db_dump_map
 
         self.state.data["current_phase"] = "transfer_done"
         self.state.save()
@@ -330,9 +356,45 @@ class HestiaToAAPanelMigrator:
         """Import sites, databases, SSL, mail, cron into aaPanel."""
         console.print("\n[bold cyan]Phase 3: Importing to aaPanel...[/bold cyan]")
 
+        aapanel_local = self.config.get("aapanel", {}).get("local", False)
+
+        # If local, try to auto-fix panel availability
+        if aapanel_local:
+            self.ssh.connect()
+            try:
+                if not self.ssh.is_panel_running():
+                    console.print("[yellow]aaPanel service is not running. Starting...[/yellow]")
+                    self.ssh.start_panel()
+                    import time
+                    time.sleep(3)
+
+                # Auto-detect port if default didn't work
+                detected_port = self.ssh.detect_panel_port()
+                if detected_port and detected_port != 8888:
+                    old_url = self.api.panel_url
+                    self.api.panel_url = f"http://127.0.0.1:{detected_port}"
+                    console.print(f"[cyan]Auto-detected aaPanel port: {detected_port}[/cyan]")
+            finally:
+                self.ssh.disconnect()
+
         if not self.api.test_connection():
-            console.print("[red]Cannot connect to aaPanel API. Check config.[/red]")
-            return []
+            # If local, provide more help
+            if aapanel_local:
+                console.print("[yellow]Trying to detect correct port...[/yellow]")
+                self.ssh.connect()
+                try:
+                    port = self.ssh.detect_panel_port()
+                    if port:
+                        self.api.panel_url = f"http://127.0.0.1:{port}"
+                        console.print(f"[cyan]Retrying with port {port}...[/cyan]")
+                        if self.api.test_connection():
+                            console.print(f"[green]Connected! Using port {port}[/green]")
+                finally:
+                    self.ssh.disconnect()
+
+            if not self.api.test_connection():
+                console.print("[red]Cannot connect to aaPanel API. Check config.[/red]")
+                return []
 
         migration_cfg = self.config.get("migration", {})
         do_databases = migration_cfg.get("databases", True)
@@ -426,37 +488,65 @@ class HestiaToAAPanelMigrator:
             "error": "",
         }
 
-        # --- Step 1: Upload files ---
+        aapanel_local = self.config.get("aapanel", {}).get("local", False)
+
+        # --- Step 1: Transfer web files ---
         if not self.dry_run:
-            self.ssh.connect()
-            try:
-                web_root = self.ssh.create_web_root(domain)
+            web_root = f"/www/wwwroot/{domain}"
 
-                # Upload files via SCP from local temp
-                archive_path = transfer.get("archive_local_path")
-                if archive_path and os.path.exists(archive_path):
-                    # Extract archive on aaPanel server
-                    remote_archive = f"{self.ssh.tmp_dir}/{os.path.basename(archive_path)}"
-                    self.ssh.ensure_dir(self.ssh.tmp_dir)
+            if aapanel_local:
+                # Running ON aaPanel server → rsync directly from Hestia
+                # Skip archive+upload+extract entirely — much faster!
+                self.ssh.connect()
+                try:
+                    self.ssh.ensure_dir(web_root)
+                finally:
+                    self.ssh.disconnect()
 
-                    # Upload (SCP or local cp depending on config)
-                    ok, err = self.transfer_mgr.transfer(
-                        archive_path, remote_archive,
-                        direction="upload",
-                        local=self.config.get("aapanel", {}).get("local", False),
-                    )
-                    if ok:
-                        # Extract tar.gz to web root
-                        self.ssh.exec(
-                            f"tar xzf {remote_archive} -C {web_root} --strip-components=1 2>/dev/null || "
-                            f"tar xzf {remote_archive} -C {web_root} 2>/dev/null"
+                hestia_user = site.get("user", "unknown")
+                ok, err = self.transfer_mgr.rsync_site_from_hestia(
+                    hestia_user=hestia_user,
+                    domain=domain,
+                    aapanel_web_root=web_root,
+                )
+                if ok:
+                    log.info(f"Direct rsync OK: {domain} → {web_root}")
+                else:
+                    log.error(f"Direct rsync failed for {domain}: {err}")
+
+                # Fix permissions locally
+                self.ssh.connect()
+                try:
+                    self.ssh.exec(f"chown -R www:www {web_root} 2>/dev/null || chown -R www-data:www-data {web_root} 2>/dev/null || true")
+                finally:
+                    self.ssh.disconnect()
+            else:
+                # Remote aaPanel → use archive approach
+                self.ssh.connect()
+                try:
+                    self.ssh.create_web_root(domain)
+
+                    archive_path = transfer.get("archive_local_path")
+                    if archive_path and os.path.exists(archive_path):
+                        remote_archive = f"{self.ssh.tmp_dir}/{os.path.basename(archive_path)}"
+                        self.ssh.ensure_dir(self.ssh.tmp_dir)
+
+                        ok, err = self.transfer_mgr.transfer(
+                            archive_path, remote_archive,
+                            direction="upload",
+                            local=False,
                         )
-                        self.ssh.exec(f"chown -R www:www {web_root} 2>/dev/null || true")
-                        log.info(f"Extracted web files to {web_root}")
-                    else:
-                        log.error(f"Failed to upload archive for {domain}: {err}")
-            finally:
-                self.ssh.disconnect()
+                        if ok:
+                            self.ssh.exec(
+                                f"tar xzf {remote_archive} -C {web_root} --strip-components=1 2>/dev/null || "
+                                f"tar xzf {remote_archive} -C {web_root} 2>/dev/null"
+                            )
+                            self.ssh.exec(f"chown -R www:www {web_root} 2>/dev/null || true")
+                            log.info(f"Extracted web files to {web_root}")
+                        else:
+                            log.error(f"Failed to upload archive for {domain}: {err}")
+                finally:
+                    self.ssh.disconnect()
 
         # --- Step 2: Import database dumps ---
         db_dump_path = transfer.get("db_dump_local_path")

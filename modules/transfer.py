@@ -197,6 +197,65 @@ class TransferManager:
             return self._scp(host, user, remote_path, local_path, key, port, direction)
 
     # ------------------------------------------------------------------
+    # Direct server-to-server rsync (skip intermediate temp)
+    # ------------------------------------------------------------------
+
+    def rsync_site_from_hestia(
+        self,
+        hestia_user: str,
+        domain: str,
+        aapanel_web_root: str,
+    ) -> Tuple[bool, str]:
+        """Rsync web files directly from HestiaCP to aaPanel web root.
+
+        This avoids the double-transfer (Hestia→temp→aaPanel).
+        Use when running on the aaPanel server itself.
+
+        Rsyncs: Hestia:/home/{user}/web/{domain}/public_html/ → aapanel_web_root/
+        And:    Hestia:/home/{user}/conf/web/{domain}/ → alongside web files
+        """
+        hestia_src = f"{self.hestia_user}@{self.hestia_host}:/home/{hestia_user}/web/{domain}/"
+        dst = aapanel_web_root
+
+        ssh_opts = " ".join(self._ssh_opts(self.hestia_key, self.hestia_port))
+        rsh = f"ssh {ssh_opts}"
+
+        # Ensure destination exists
+        os.makedirs(dst, exist_ok=True)
+
+        cmd = [
+            "rsync", "-avz",
+            "--partial",
+            "--timeout=300",
+            "--exclude=stats",
+            "--exclude=logs",
+            "-e", rsh,
+            hestia_src,
+            dst + "/",
+        ]
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if result.returncode == 0:
+                # Also rsync nginx/apache/php-fpm configs for reference
+                conf_src = f"{self.hestia_user}@{self.hestia_host}:/home/{hestia_user}/conf/web/{domain}/"
+                # Store configs in a subdirectory for reference
+                conf_dst = os.path.join(aapanel_web_root, "_hestia_configs")
+                os.makedirs(conf_dst, exist_ok=True)
+                subprocess.run(
+                    ["rsync", "-avz", "--partial", "--timeout=60", "-e", rsh, conf_src, conf_dst + "/"],
+                    capture_output=True, text=True, timeout=120,
+                )
+                log.info(f"Direct rsync: {domain} → {aapanel_web_root}")
+                return True, ""
+            else:
+                return False, result.stderr.strip()
+        except subprocess.TimeoutExpired:
+            return False, "Direct rsync timeout (10 min)"
+        except Exception as e:
+            return False, str(e)
+
+    # ------------------------------------------------------------------
     # Batch transfers
     # ------------------------------------------------------------------
 

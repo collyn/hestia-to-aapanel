@@ -471,11 +471,36 @@ class AAPanelAPI:
         return "".join(secrets.choice(alphabet) for _ in range(length))
 
     def test_connection(self) -> bool:
-        """Test API connectivity by listing sites."""
+        """Test API connectivity by listing sites. Provides detailed diagnostics."""
         try:
+            # Simple GET test first — check basic connectivity
+            try:
+                resp = self._session.get(
+                    f"{self.panel_url}/login",
+                    timeout=10,
+                )
+                log.debug(f"Panel login page: HTTP {resp.status_code}")
+            except requests.exceptions.ConnectionError:
+                # Try common alternative ports
+                log.error(f"Cannot reach aaPanel at {self.panel_url}")
+                log.error("Troubleshooting:")
+                log.error("  1. Is the aaPanel service running? Run: service bt start")
+                log.error("  2. Is the port correct? Default: 8888. Check: bt 14")
+                log.error("  3. Firewall blocking? Run: ufw allow 8888")
+                log.error("  4. Running on aaPanel server? Set aapanel.local=true in config")
+                return False
+            except Exception as e:
+                log.error(f"Unexpected error connecting to {self.panel_url}: {e}")
+                return False
+
+            # Now test API authentication
             self.list_sites()
-            log.info("aaPanel API connection OK")
+            log.info(f"aaPanel API connection OK: {self.panel_url}")
             return True
         except AAPanelAPIError as e:
-            log.error(f"aaPanel API connection failed: {e}")
+            log.error(f"aaPanel API auth failed: {e}")
+            log.error("Check:")
+            log.error("  1. API key is correct (aaPanel → Settings → API)")
+            log.error("  2. Your IP is in the API whitelist")
+            log.error("  3. API is enabled in aaPanel settings")
             return False

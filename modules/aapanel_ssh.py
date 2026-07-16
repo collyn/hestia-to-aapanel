@@ -380,6 +380,63 @@ class AAPanelSSH:
         return result
 
     # ------------------------------------------------------------------
+    # Panel status & port detection
+    # ------------------------------------------------------------------
+
+    def detect_panel_port(self) -> Optional[int]:
+        """Auto-detect the aaPanel web port.
+
+        Checks multiple sources:
+        1. Panel config file
+        2. Running process listening port
+        """
+        # Method 1: Check panel config
+        config_files = [
+            f"{self.PANEL_DIR}/data/port.pl",
+            f"{self.PANEL_DIR}/data/panelPort.pl",
+        ]
+        for cf in config_files:
+            _, content, _ = self.exec(f"cat {cf} 2>/dev/null", warn_on_error=False)
+            if content and content.strip().isdigit():
+                port = int(content.strip())
+                log.info(f"Detected aaPanel port from config: {port}")
+                return port
+
+        # Method 2: Check listening port of panel process
+        _, content, _ = self.exec(
+            "ss -tlnp 2>/dev/null | grep -E 'python.*panel|gunicorn|waitress' | awk '{print $4}' | grep -oP ':\\K\\d+' | head -1",
+            warn_on_error=False,
+        )
+        if content and content.strip().isdigit():
+            port = int(content.strip())
+            log.info(f"Detected aaPanel port from process: {port}")
+            return port
+
+        # Method 3: Check common ports
+        for port in [8888, 7800, 888, 2087]:
+            _, content, _ = self.exec(
+                f"curl -sS -o /dev/null -w '%{{http_code}}' --max-time 3 http://127.0.0.1:{port}/login 2>/dev/null",
+                warn_on_error=False,
+            )
+            if content and content.strip().isdigit() and int(content.strip()) > 0:
+                log.info(f"Found aaPanel responding on port: {port}")
+                return port
+
+        return None
+
+    def is_panel_running(self) -> bool:
+        """Check if aaPanel service is running."""
+        _, content, _ = self.exec(
+            r"service bt status 2>/dev/null || systemctl is-active bt 2>/dev/null || ps aux | grep -v grep | grep -q 'BT-Panel\|BT-Task'",
+            warn_on_error=False,
+        )
+        return "active" in content.lower() or "running" in content.lower()
+
+    def start_panel(self):
+        """Start the aaPanel service."""
+        self.exec("service bt start 2>/dev/null || systemctl start bt 2>/dev/null || /etc/init.d/bt start 2>/dev/null")
+
+    # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
 
