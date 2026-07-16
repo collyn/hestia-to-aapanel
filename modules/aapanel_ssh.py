@@ -431,7 +431,7 @@ class AAPanelSSH:
         """
         scheme = "https" if use_https else "http"
         cmd = (
-            f"curl -sS -o /dev/null -w '%{{http_code}}' "
+            f"curl -sSk -o /dev/null -w '%{{http_code}}' "
             f"--max-time {timeout} "
             f"-H 'Host: {domain}' "
             f"{scheme}://127.0.0.1/"
