@@ -401,6 +401,7 @@ class HestiaToAAPanelMigrator:
         sites: List[Dict[str, Any]],
         transfer_results: Dict[str, Dict[str, Any]],
         retry_failed: bool = False,
+        force: bool = False,
     ) -> List[Dict[str, Any]]:
         """Import sites, databases, SSL, mail, cron into aaPanel."""
         console.print("\n[bold cyan]Phase 3: Importing to aaPanel...[/bold cyan]")
@@ -931,7 +932,7 @@ class HestiaToAAPanelMigrator:
             transfer_results = self.phase_transfer(sites)
 
             # Phase 3: Import
-            results = self.phase_import(sites, transfer_results, retry_failed=retry_failed)
+            results = self.phase_import(sites, transfer_results, retry_failed=retry_failed, force=force)
 
             # Summary
             print_summary(self.state)
