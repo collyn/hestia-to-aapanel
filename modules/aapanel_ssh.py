@@ -180,6 +180,44 @@ class AAPanelSSH:
         return path
 
     # ------------------------------------------------------------------
+    # Database management
+    # ------------------------------------------------------------------
+
+    def create_mysql_database(
+        self,
+        db_name: str,
+        db_user: str,
+        db_password: str,
+        charset: str = "utf8mb4",
+    ) -> bool:
+        """Create a MySQL database and user directly (fallback when API fails).
+
+        Executes raw SQL to create DB + user + grant privileges.
+        """
+        # Escape special chars for SQL
+        safe_db = db_name.replace("`", "``")
+        safe_user = db_user.replace("'", "\\'")
+        safe_pass = db_password.replace("'", "\\'")
+
+        sql = (
+            f"CREATE DATABASE IF NOT EXISTS `{safe_db}` "
+            f"DEFAULT CHARACTER SET {charset} COLLATE {charset}_unicode_ci; "
+            f"CREATE USER IF NOT EXISTS '{safe_user}'@'%' IDENTIFIED BY '{safe_pass}'; "
+            f"GRANT ALL PRIVILEGES ON `{safe_db}`.* TO '{safe_user}'@'%'; "
+            f"CREATE USER IF NOT EXISTS '{safe_user}'@'localhost' IDENTIFIED BY '{safe_pass}'; "
+            f"GRANT ALL PRIVILEGES ON `{safe_db}`.* TO '{safe_user}'@'localhost'; "
+            f"FLUSH PRIVILEGES;"
+        )
+
+        cmd = f"mysql -e \"{sql}\""
+        exit_code, stdout, stderr = self.exec(cmd, timeout=30)
+        if exit_code != 0:
+            raise RuntimeError(f"MySQL create DB failed: {stderr}")
+
+        log.info(f"Created MySQL DB: {db_name} (user={db_user})")
+        return True
+
+    # ------------------------------------------------------------------
     # Database import
     # ------------------------------------------------------------------
 

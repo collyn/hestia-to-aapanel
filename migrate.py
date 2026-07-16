@@ -642,7 +642,7 @@ class HestiaToAAPanelMigrator:
 
         site_id = result["site_id"]
 
-        # --- Step 3: Create databases in aaPanel + import dumps ---
+        # --- Step 3: Create databases + import dumps ---
         db_dump_path = transfer.get("db_dump_local_path")
         if do_databases and not self.dry_run:
             dbs = site.get("databases", [])
@@ -656,29 +656,45 @@ class HestiaToAAPanelMigrator:
                 if not db_name:
                     continue
 
-                # Create database in aaPanel first
                 normalized_name = self.transformer.normalize_db_name(db_name, domain)
                 normalized_user = self.transformer.normalize_db_user(db_user, domain)
-                address = self.transformer.db_access_address(db_host)
+                db_password = db_pass or self.transformer._gen_password()
 
+                # Try aaPanel API first, fall back to direct MySQL
+                db_created_via_api = False
                 try:
-                    if not self.dry_run:
-                        self.api.add_database(
-                            name=normalized_name,
-                            db_user=normalized_user,
-                            password=db_pass or self.transformer._gen_password(),
-                            charset=db_charset,
-                            address=address,
-                            site_id=site_id,
-                        )
-                        result["db_created"] = True
-                        log.info(f"Created database: {normalized_name}")
+                    self.api.add_database(
+                        name=normalized_name,
+                        db_user=normalized_user,
+                        password=db_password,
+                        charset=db_charset,
+                        address=self.transformer.db_access_address(db_host),
+                        site_id=site_id,
+                    )
+                    db_created_via_api = True
+                    result["db_created"] = True
+                    log.info(f"Created database via API: {normalized_name}")
                 except AAPanelAPIError as e:
                     if "already exists" in str(e).lower():
-                        log.warning(f"Database {normalized_name} already exists")
                         result["db_created"] = True
+                        log.info(f"Database {normalized_name} already exists")
                     else:
-                        log.error(f"Failed to create database {normalized_name}: {e}")
+                        # API failed — create via direct MySQL commands
+                        log.warning(f"API database creation failed ({e}), trying direct MySQL...")
+                        self.ssh.connect()
+                        try:
+                            self.ssh.create_mysql_database(
+                                db_name=db_name,
+                                db_user=normalized_user,
+                                db_password=db_password,
+                                charset=db_charset,
+                            )
+                            result["db_created"] = True
+                            log.info(f"Created database via MySQL: {db_name}")
+                        except Exception as mysql_err:
+                            log.error(f"Failed to create database {db_name}: {mysql_err}")
+                        finally:
+                            self.ssh.disconnect()
 
                 # Import dump if available
                 if db_dump_path and os.path.exists(db_dump_path) and result.get("db_created"):
@@ -697,7 +713,7 @@ class HestiaToAAPanelMigrator:
                                 self.ssh.import_mysql_dump(remote_dump, db_name)
                     finally:
                         self.ssh.disconnect()
-                break  # Only process first DB for now (matching previous behavior)
+                break  # Only process first DB for now
 
         # --- Step 4: Add domain aliases ---
 
