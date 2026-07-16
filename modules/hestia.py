@@ -217,6 +217,66 @@ class HestiaClient:
             return [{"DATABASE": k, **v} for k, v in result.items()]
         return []
 
+    def get_databases_for_domain(self, user: str, domain: str) -> List[Dict[str, Any]]:
+        """Find databases actually used by a specific domain.
+
+        HestiaCP stores databases per-user, not per-domain. This method scans
+        the web root for CMS config files to find the actual DB name.
+        """
+        all_dbs = self.get_databases(user)
+        if not all_dbs:
+            return []
+
+        web_root = f"/home/{user}/web/{domain}/public_html"
+
+        # Known config files and their DB name patterns
+        config_checks = [
+            (f"{web_root}/wp-config.php", r"define\s*\(\s*'DB_NAME'\s*,\s*'([^']+)'"),
+            (f"{web_root}/.env", r"DB_DATABASE=(\S+)"),
+            (f"{web_root}/config.php", r"'database'\s*=>\s*'([^']+)'"),
+            (f"{web_root}/app/etc/env.php", r"'dbname'\s*=>\s*'([^']+)'"),  # Magento
+            (f"{web_root}/sites/default/settings.php", r"'database'\s*=>\s*'([^']+)'"),  # Drupal
+            (f"{web_root}/configuration.php", r"\$db\s*=\s*'([^']+)'"),  # Joomla
+        ]
+
+        for config_path, pattern in config_checks:
+            exit_code, content, _ = self.exec(
+                f"cat {config_path} 2>/dev/null", warn_on_error=False
+            )
+            if exit_code == 0 and content:
+                match = re.search(pattern, content)
+                if match:
+                    db_name = match.group(1)
+                    # Find this DB in the all_dbs list
+                    for db in all_dbs:
+                        db_entry_name = db.get("DATABASE", db.get("database", ""))
+                        if db_entry_name == db_name or db_entry_name.endswith(f"_{db_name}"):
+                            log.info(f"Matched DB {db_entry_name} → {domain} (via {config_path})")
+                            return [db]
+
+        # Heuristic: match by domain name substring in database name
+        domain_key = domain.split(".")[0].replace("-", "_")
+        matched = []
+        for db in all_dbs:
+            db_name = db.get("DATABASE", db.get("database", ""))
+            if domain_key in db_name.lower():
+                matched.append(db)
+
+        if matched:
+            log.info(f"Heuristic matched {len(matched)} DB(s) for {domain}: {[d.get('DATABASE','') for d in matched]}")
+            return matched
+
+        # Fallback: return empty (site has no specific DB detected)
+        log.debug(f"No DB matched for {domain}, returning empty")
+        return []
+        """List all databases for a user."""
+        result = self.exec_json(f"{self.bin_path}/v-list-databases {user} json")
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            return [{"DATABASE": k, **v} for k, v in result.items()]
+        return []
+
     def get_dns_domains(self, user: str) -> List[str]:
         """List all DNS domains for a user."""
         result = self.exec_json(f"{self.bin_path}/v-list-dns-domains {user} json")
@@ -621,8 +681,8 @@ class HestiaClient:
             "has_ssl": has_ssl,
             "web_root": self.get_web_root(user, domain),
             "domain_detail": domain_detail,
-            # Databases
-            "databases": self.get_databases(user),
+            # Databases (only those matching this domain)
+            "databases": self.get_databases_for_domain(user, domain),
             # DNS (optional)
             "dns_records": [] if not self.get_dns_domains(user) else self.get_dns_records(user, domain) if domain in self.get_dns_domains(user) else [],
             # Mail (optional)
