@@ -589,24 +589,21 @@ class HestiaClient:
         user: str,
         domain: str,
     ) -> Tuple[str, str]:
-        """Create a tar.gz archive of web files.
+        """Create a tar.gz archive of web files (public_html/ contents only).
 
         Returns (remote_tar_path, tar_filename).
         """
-        web_root = f"/home/{user}/web/{domain}/"
-        config_dir = f"/home/{user}/conf/web/{domain}/"
-
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{domain}_{timestamp}.tar.gz"
         remote_path = f"{self.tmp_dir}/{filename}"
 
         self.exec(f"mkdir -p {self.tmp_dir}")
 
-        # Archive web files + configs in one tarball
+        # Archive ONLY public_html/ contents → aaPanel expects files at web root directly
+        # -C changes to public_html dir, . means everything inside it
         tar_cmd = (
             f"tar czf {remote_path} "
-            f"-C /home/{user}/web {domain}/ "
-            f"-C /home/{user}/conf/web {domain}/ "
+            f"-C /home/{user}/web/{domain}/public_html . "
             f"2>/dev/null"
         )
         exit_code, _, stderr = self.exec(tar_cmd, timeout=300)

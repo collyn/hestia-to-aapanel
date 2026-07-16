@@ -618,7 +618,6 @@ class HestiaToAAPanelMigrator:
                         )
                         if ok:
                             self.ssh.exec(
-                                f"tar xzf {remote_archive} -C {web_root} --strip-components=1 2>/dev/null || "
                                 f"tar xzf {remote_archive} -C {web_root} 2>/dev/null"
                             )
                             self.ssh.exec(f"chown -R www:www {web_root} 2>/dev/null || true")

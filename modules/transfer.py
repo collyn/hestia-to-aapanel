@@ -213,48 +213,44 @@ class TransferManager:
     ) -> Tuple[bool, str]:
         """Rsync web files directly from HestiaCP to aaPanel web root.
 
-        This avoids the double-transfer (Hestia→temp→aaPanel).
-        Use when running on the aaPanel server itself.
+        Rsyncs ONLY public_html/ contents (not the directory itself):
+          Hestia:/home/{user}/web/{domain}/public_html/ → aapanel_web_root/
 
-        Rsyncs: Hestia:/home/{user}/web/{domain}/public_html/ → aapanel_web_root/
-        And:    Hestia:/home/{user}/conf/web/{domain}/ → alongside web files
+        Old Hestia configs are saved to aapanel_web_root/_hestia_configs/ for reference.
         """
-        hestia_src = f"{self.hestia_user}@{self.hestia_host}:/home/{hestia_user}/web/{domain}/"
+        # Rsync public_html CONTENTS → aaPanel web root (trailing / is critical!)
+        hestia_src = f"{self.hestia_user}@{self.hestia_host}:/home/{hestia_user}/web/{domain}/public_html/"
         dst = aapanel_web_root
 
         ssh_opts = " ".join(self._ssh_opts(self.hestia_key, self.hestia_port))
         rsh = f"ssh {ssh_opts}"
 
-        # Ensure destination exists
         os.makedirs(dst, exist_ok=True)
 
         cmd = [
             "rsync", "-avz",
             "--partial",
             "--timeout=300",
-            "--exclude=stats",
-            "--exclude=logs",
             "-e", rsh,
             hestia_src,
-            dst + "/",
+            dst + "/",   # trailing / = copy contents, not the directory
         ]
 
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-            if result.returncode == 0:
-                # Also rsync nginx/apache/php-fpm configs for reference
-                conf_src = f"{self.hestia_user}@{self.hestia_host}:/home/{hestia_user}/conf/web/{domain}/"
-                # Store configs in a subdirectory for reference
-                conf_dst = os.path.join(aapanel_web_root, "_hestia_configs")
-                os.makedirs(conf_dst, exist_ok=True)
-                subprocess.run(
-                    ["rsync", "-avz", "--partial", "--timeout=60", "-e", rsh, conf_src, conf_dst + "/"],
-                    capture_output=True, text=True, timeout=120,
-                )
-                log.info(f"Direct rsync: {domain} → {aapanel_web_root}")
-                return True, ""
-            else:
+            if result.returncode != 0:
                 return False, result.stderr.strip()
+
+            # Also rsync nginx/apache/php-fpm configs for reference (to subdir)
+            conf_src = f"{self.hestia_user}@{self.hestia_host}:/home/{hestia_user}/conf/web/{domain}/"
+            conf_dst = os.path.join(aapanel_web_root, "_hestia_configs")
+            os.makedirs(conf_dst, exist_ok=True)
+            subprocess.run(
+                ["rsync", "-avz", "--partial", "--timeout=60", "-e", rsh, conf_src, conf_dst + "/"],
+                capture_output=True, text=True, timeout=120,
+            )
+            log.info(f"Direct rsync: {domain} (public_html/) → {aapanel_web_root}")
+            return True, ""
         except subprocess.TimeoutExpired:
             return False, "Direct rsync timeout (10 min)"
         except Exception as e:
