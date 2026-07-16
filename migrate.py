@@ -291,7 +291,7 @@ class HestiaToAAPanelMigrator:
         if do_databases:
             for site in sites:
                 for db in site.get("databases", []):
-                    db_name = db.get("DATABASE", db.get("database", ""))
+                    db_name = db.get("DATABASE") or db.get("DB") or db.get("database", "")
                     if db_name and db_name not in unique_dbs:
                         unique_dbs[db_name] = site["user"]
 
@@ -352,7 +352,7 @@ class HestiaToAAPanelMigrator:
                     if dbs and do_databases:
                         db_dumps = []
                         for db in dbs:
-                            db_name = db.get("DATABASE", db.get("database", ""))
+                            db_name = (db.get("DATABASE") or db.get("DB") or db.get("database", ""))
                             if db_name and db_name in db_dump_map:
                                 db_dumps.append({
                                     "db_name": db_name,
@@ -375,7 +375,7 @@ class HestiaToAAPanelMigrator:
                 if dbs and do_databases:
                     db_dumps = []
                     for db in dbs:
-                        db_name = db.get("DATABASE", db.get("database", ""))
+                        db_name = (db.get("DATABASE") or db.get("DB") or db.get("database", ""))
                         if db_name and db_name in db_dump_map:
                             db_dumps.append({
                                 "db_name": db_name,
@@ -674,11 +674,14 @@ class HestiaToAAPanelMigrator:
         if do_databases and not self.dry_run:
             dbs = site.get("databases", [])
             for db in dbs:
-                db_name = db.get("DATABASE", db.get("database", ""))
-                db_user = db.get("DBUSER", db.get("dbuser", ""))
-                db_pass = db.get("DBPASS", db.get("dbpass", ""))
-                db_host = db.get("HOST", db.get("host", "localhost"))
-                db_charset = db.get("CHARSET", db.get("charset", "utf8mb4"))
+                # HestiaCP keys: DATABASE/DB, DBUSER, PASSWORD (NOT DBPASS!), HOST, CHARSET
+                db_name = db.get("DATABASE") or db.get("DB") or db.get("database", "")
+                db_user = db.get("DBUSER") or db.get("USER") or db.get("dbuser", "")
+                db_pass = db.get("PASSWORD") or db.get("DBPASS") or db.get("dbpass", "")
+                db_host = db.get("HOST") or db.get("host", "localhost")
+                db_charset = db.get("CHARSET") or db.get("charset", "utf8mb4")
+                log.info(f"DB creds for {domain}: name={db_name}, user={db_user}, "
+                         f"pass={'***' if db_pass else 'EMPTY!'}, host={db_host}")
 
                 if not db_name:
                     continue

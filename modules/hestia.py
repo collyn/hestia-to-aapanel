@@ -249,7 +249,7 @@ class HestiaClient:
                     db_name = match.group(1)
                     # Find this DB in the all_dbs list
                     for db in all_dbs:
-                        db_entry_name = db.get("DATABASE", db.get("database", ""))
+                        db_entry_name = (db.get("DATABASE") or db.get("DB") or db.get("database", ""))
                         if db_entry_name == db_name or db_entry_name.endswith(f"_{db_name}"):
                             log.info(f"Matched DB {db_entry_name} → {domain} (via {config_path})")
                             return [db]
@@ -258,7 +258,7 @@ class HestiaClient:
         domain_key = domain.split(".")[0].replace("-", "_")
         matched = []
         for db in all_dbs:
-            db_name = db.get("DATABASE", db.get("database", ""))
+            db_name = (db.get("DATABASE") or db.get("DB") or db.get("database", ""))
             if domain_key in db_name.lower():
                 matched.append(db)
 
