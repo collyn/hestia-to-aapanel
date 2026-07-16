@@ -43,7 +43,7 @@ class AAPanelSSH:
         user: str = "root",
         password: Optional[str] = None,
         ssh_key: Optional[str] = None,
-        tmp_dir: str = "/tmp/aapanel_migration",
+        tmp_dir: str = "/root/aapanel_migration_dumps",
         local: bool = False,
     ):
         self.host = host

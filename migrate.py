@@ -789,27 +789,16 @@ class HestiaToAAPanelMigrator:
     # ------------------------------------------------------------------
 
     def cleanup(self):
-        """Clean up temporary files."""
-        # Clean local temp
+        """Clean up temporary files. Preserves remote dumps/archives for resume."""
+        # Clean local temp only (intermediate transfer files)
         import shutil
         if self.local_tmp.exists():
             shutil.rmtree(self.local_tmp, ignore_errors=True)
             log.info(f"Cleaned local temp: {self.local_tmp}")
 
-        # Clean remote temps (best effort)
-        try:
-            self.hestia.connect()
-            self.hestia.cleanup_temp()
-            self.hestia.disconnect()
-        except Exception:
-            pass
-
-        try:
-            self.ssh.connect()
-            self.ssh.cleanup_temp()
-            self.ssh.disconnect()
-        except Exception:
-            pass
+        # NOTE: We do NOT clean remote temp dirs on Hestia/aaPanel.
+        # Database dumps and web archives are preserved for --resume.
+        # They are small relative to disk space and prevent re-dumping 197 databases.
 
     # ------------------------------------------------------------------
     # Main entry

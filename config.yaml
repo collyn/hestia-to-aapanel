@@ -41,10 +41,12 @@ migration:
   transfer_method: "rsync"
 
   # Path to temporary directory for dumps/archives on Hestia server
-  hestia_tmp_dir: "/tmp/hestia_migration"
+  # Use a persistent path (not /tmp) to preserve dumps for --resume
+  hestia_tmp_dir: "/root/hestia_migration_dumps"
 
   # Path to temporary directory for receiving files on aaPanel server
-  aapanel_tmp_dir: "/tmp/aapanel_migration"
+  # Use a persistent path (not /tmp) to preserve files for --resume
+  aapanel_tmp_dir: "/root/aapanel_migration_dumps"
 
   # Max parallel transfers (files + db dumps)
   parallel_workers: 4

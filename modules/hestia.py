@@ -49,7 +49,7 @@ class HestiaClient:
         password: Optional[str] = None,
         ssh_key: Optional[str] = None,
         hestia_path: str = "/usr/local/hestia",
-        tmp_dir: str = "/tmp/hestia_migration",
+        tmp_dir: str = "/root/hestia_migration_dumps",
         local: bool = False,
     ):
         self.host = host
