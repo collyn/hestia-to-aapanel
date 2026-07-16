@@ -664,28 +664,27 @@ class HestiaToAAPanelMigrator:
                 if not db_name:
                     continue
 
-                normalized_name = self.transformer.normalize_db_name(db_name, domain)
-                normalized_user = self.transformer.normalize_db_user(db_user, domain)
+                # Use ORIGINAL names/passwords from HestiaCP so websites work without reconfiguration
+                # Don't normalize — wp-config.php etc. reference the original names
                 db_password = db_pass or self.transformer._gen_password()
 
                 # Try aaPanel API first, fall back to direct MySQL
-                db_created_via_api = False
+                # Use ORIGINAL db_name, db_user, db_pass so CMS configs work unchanged
                 try:
                     self.api.add_database(
-                        name=normalized_name,
-                        db_user=normalized_user,
+                        name=db_name,
+                        db_user=db_user or db_name,
                         password=db_password,
                         charset=db_charset,
                         address=self.transformer.db_access_address(db_host),
                         site_id=site_id,
                     )
-                    db_created_via_api = True
                     result["db_created"] = True
-                    log.info(f"Created database via API: {normalized_name}")
+                    log.info(f"Created database via API: {db_name}")
                 except AAPanelAPIError as e:
                     if "already exists" in str(e).lower():
                         result["db_created"] = True
-                        log.info(f"Database {normalized_name} already exists")
+                        log.info(f"Database {db_name} already exists")
                     else:
                         # API failed — create via direct MySQL commands
                         log.warning(f"API database creation failed ({e}), trying direct MySQL...")
@@ -693,7 +692,7 @@ class HestiaToAAPanelMigrator:
                         try:
                             self.ssh.create_mysql_database(
                                 db_name=db_name,
-                                db_user=normalized_user,
+                                db_user=db_user or db_name,
                                 db_password=db_password,
                                 charset=db_charset,
                             )
