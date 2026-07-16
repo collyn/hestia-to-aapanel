@@ -399,6 +399,7 @@ class HestiaToAAPanelMigrator:
         self,
         sites: List[Dict[str, Any]],
         transfer_results: Dict[str, Dict[str, Any]],
+        retry_failed: bool = False,
     ) -> List[Dict[str, Any]]:
         """Import sites, databases, SSL, mail, cron into aaPanel."""
         console.print("\n[bold cyan]Phase 3: Importing to aaPanel...[/bold cyan]")
@@ -465,11 +466,18 @@ class HestiaToAAPanelMigrator:
                 domain = site["domain"]
                 mapped_domain = self.transformer.map_domain(domain)
 
-                # Skip already migrated
+                # Skip already migrated (but not failed ones if retrying)
                 if self.state.is_migrated(mapped_domain):
-                    log.info(f"Skipping {mapped_domain} (already migrated)")
-                    progress.advance(task_id)
-                    continue
+                    if retry_failed and self.state.is_failed(mapped_domain):
+                        log.info(f"Retrying failed site: {mapped_domain}")
+                        # Remove from failed list so it can be re-processed
+                        if mapped_domain in self.state.data["failed_sites"]:
+                            self.state.data["failed_sites"].remove(mapped_domain)
+                        self.state.save()
+                    else:
+                        log.info(f"Skipping {mapped_domain} (already migrated)")
+                        progress.advance(task_id)
+                        continue
 
                 try:
                     result = self._import_site(
@@ -600,36 +608,11 @@ class HestiaToAAPanelMigrator:
                 finally:
                     self.ssh.disconnect()
 
-        # --- Step 2: Import database dumps ---
-        db_dump_path = transfer.get("db_dump_local_path")
-        if do_databases and db_dump_path and os.path.exists(db_dump_path) and not self.dry_run:
-            self.ssh.connect()
-            try:
-                dbs = site.get("databases", [])
-                if dbs:
-                    db_info = dbs[0]
-                    db_name = db_info.get("DATABASE", db_info.get("database", ""))
-                    if aapanel_local:
-                        # Already on aaPanel → import directly from local path
-                        self.ssh.import_mysql_dump(db_dump_path, db_name)
-                    else:
-                        # Remote aaPanel → upload dump first, then import
-                        remote_dump = f"{self.ssh.tmp_dir}/{os.path.basename(db_dump_path)}"
-                        self.ssh.ensure_dir(self.ssh.tmp_dir)
-                        ok, _ = self.transfer_mgr.transfer(
-                            db_dump_path, remote_dump,
-                            direction="upload",
-                            local=False,
-                        )
-                        if ok:
-                            self.ssh.import_mysql_dump(remote_dump, db_name)
-            finally:
-                self.ssh.disconnect()
-
-        # --- Step 3: Create site via API ---
+        # --- Step 2: Create site via API (MUST come before DB import) ---
         if self.dry_run:
             log.info(f"[DRY RUN] Would create site: {domain} (PHP {php_ver})")
             result["site_id"] = 0  # fake
+            site_id = 0
         else:
             aliases = [self.transformer.map_domain(a) for a in site.get("aliases", [])]
 
@@ -641,14 +624,13 @@ class HestiaToAAPanelMigrator:
                     port=80,
                     description=f"Migrated from HestiaCP (user: {user})",
                     domain_aliases=aliases,
-                    create_db=False,  # DB created separately or already exists
+                    create_db=False,  # DB created separately below
                     create_ftp=False,
                 )
                 site_id = api_result.get("siteId")
                 result["site_id"] = site_id
                 log.info(f"Created site: {domain} → siteId={site_id}")
             except AAPanelAPIError as e:
-                # Check if site already exists
                 existing = self.api.get_site_by_domain(domain)
                 if existing:
                     site_id = existing.get("id")
@@ -660,8 +642,64 @@ class HestiaToAAPanelMigrator:
 
         site_id = result["site_id"]
 
-        # --- Step 4: Add domain aliases (if not done in AddSite) ---
-        # Already handled by AddSite with domainlist parameter
+        # --- Step 3: Create databases in aaPanel + import dumps ---
+        db_dump_path = transfer.get("db_dump_local_path")
+        if do_databases and not self.dry_run:
+            dbs = site.get("databases", [])
+            for db in dbs:
+                db_name = db.get("DATABASE", db.get("database", ""))
+                db_user = db.get("DBUSER", db.get("dbuser", ""))
+                db_pass = db.get("DBPASS", db.get("dbpass", ""))
+                db_host = db.get("HOST", db.get("host", "localhost"))
+                db_charset = db.get("CHARSET", db.get("charset", "utf8mb4"))
+
+                if not db_name:
+                    continue
+
+                # Create database in aaPanel first
+                normalized_name = self.transformer.normalize_db_name(db_name, domain)
+                normalized_user = self.transformer.normalize_db_user(db_user, domain)
+                address = self.transformer.db_access_address(db_host)
+
+                try:
+                    if not self.dry_run:
+                        self.api.add_database(
+                            name=normalized_name,
+                            db_user=normalized_user,
+                            password=db_pass or self.transformer._gen_password(),
+                            charset=db_charset,
+                            address=address,
+                            site_id=site_id,
+                        )
+                        result["db_created"] = True
+                        log.info(f"Created database: {normalized_name}")
+                except AAPanelAPIError as e:
+                    if "already exists" in str(e).lower():
+                        log.warning(f"Database {normalized_name} already exists")
+                        result["db_created"] = True
+                    else:
+                        log.error(f"Failed to create database {normalized_name}: {e}")
+
+                # Import dump if available
+                if db_dump_path and os.path.exists(db_dump_path) and result.get("db_created"):
+                    self.ssh.connect()
+                    try:
+                        if aapanel_local:
+                            self.ssh.import_mysql_dump(db_dump_path, db_name)
+                        else:
+                            remote_dump = f"{self.ssh.tmp_dir}/{os.path.basename(db_dump_path)}"
+                            self.ssh.ensure_dir(self.ssh.tmp_dir)
+                            ok, _ = self.transfer_mgr.transfer(
+                                db_dump_path, remote_dump,
+                                direction="upload", local=False,
+                            )
+                            if ok:
+                                self.ssh.import_mysql_dump(remote_dump, db_name)
+                    finally:
+                        self.ssh.disconnect()
+                break  # Only process first DB for now (matching previous behavior)
+
+        # --- Step 4: Add domain aliases ---
 
         # --- Step 5: SSL ---
         if do_ssl and site.get("has_ssl") and site.get("ssl_certs"):
@@ -808,7 +846,7 @@ class HestiaToAAPanelMigrator:
     # Main entry
     # ------------------------------------------------------------------
 
-    def run(self, resume: bool = False, rollback: bool = False):
+    def run(self, resume: bool = False, rollback: bool = False, retry_failed: bool = False):
         """Run the full migration workflow."""
         print_banner()
 
@@ -869,7 +907,7 @@ class HestiaToAAPanelMigrator:
             transfer_results = self.phase_transfer(sites)
 
             # Phase 3: Import
-            results = self.phase_import(sites, transfer_results)
+            results = self.phase_import(sites, transfer_results, retry_failed=retry_failed)
 
             # Summary
             print_summary(self.state)
@@ -927,6 +965,11 @@ Examples:
         action="store_true",
         help="Remove all migrated sites from aaPanel",
     )
+    parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Retry sites that failed in a previous run",
+    )
 
     args = parser.parse_args()
 
@@ -943,6 +986,7 @@ Examples:
     migrator.run(
         resume=args.resume,
         rollback=args.rollback,
+        retry_failed=args.retry_failed,
     )
 
 
