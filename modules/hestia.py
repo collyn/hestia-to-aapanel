@@ -33,8 +33,6 @@ PHP_FPM_TEMPLATES = {
     "PHP-8_2": "82",
     "PHP-8_3": "83",
     "PHP-8_4": "84",
-    "default": "74",
-    "hosting": "74",
 }
 
 
@@ -291,39 +289,76 @@ class HestiaClient:
     def detect_php_version(self, user: str, domain: str) -> str:
         """Detect PHP version from HestiaCP config files.
 
-        Checks the PHP-FPM backend template name and the socket path.
+        Detection priority:
+        1. Nginx config fastcgi_pass socket (most reliable, per-domain)
+        2. PHP-FPM pool config listen directive
+        3. Backend template name (only if it contains explicit version)
+        4. System default PHP
         """
-        # Method 1: Check backend template from web config
-        detail = self.get_web_domain_detail(user, domain)
-        backend_tpl = detail.get("BACKEND", "") or detail.get("BACKEND_TPL", "") or ""
-
-        if backend_tpl:
-            for tpl_name, version in PHP_FPM_TEMPLATES.items():
-                if tpl_name in backend_tpl:
-                    return version
-            # If template name contains PHP version directly
-            match = re.search(r"PHP[-_]?(\d)[-_]?(\d)", backend_tpl)
+        # Method 1: Nginx config — contains actual fastcgi_pass socket
+        nginx_conf = f"/home/{user}/conf/web/{domain}/nginx.conf"
+        exit_code, content, _ = self.exec(f"cat {nginx_conf} 2>/dev/null", warn_on_error=False)
+        if exit_code == 0:
+            # Look for: fastcgi_pass unix:/run/php/php8.1-fpm-{user}.sock;
+            match = re.search(r"fastcgi_pass\s+unix:/run/php/php(\d+)\.(\d+)-fpm", content)
             if match:
-                return f"{match.group(1)}{match.group(2)}"
+                ver = f"{match.group(1)}{match.group(2)}"
+                log.debug(f"PHP {ver} detected via nginx config for {domain}")
+                return ver
+            # Alternative: fastcgi_pass 127.0.0.1:9000 style → check upstream
+            match = re.search(r"fastcgi_pass\s+unix:/var/run/php/php(\d+)\.(\d+)-fpm", content)
+            if match:
+                ver = f"{match.group(1)}{match.group(2)}"
+                log.debug(f"PHP {ver} detected via nginx config (alt path) for {domain}")
+                return ver
 
-        # Method 2: Check PHP-FPM socket
-        php_conf = f"/home/{user}/conf/web/{domain}/php-fpm.conf"
-        exit_code, content, _ = self.exec(f"cat {php_conf} 2>/dev/null", warn_on_error=False)
+        # Apache config
+        apache_conf = f"/home/{user}/conf/web/{domain}/apache2.conf"
+        exit_code, content, _ = self.exec(f"cat {apache_conf} 2>/dev/null", warn_on_error=False)
         if exit_code == 0:
             match = re.search(r"php(\d+)\.(\d+)-fpm", content)
             if match:
-                return f"{match.group(1)}{match.group(2)}"
-            # Alternative: check listen socket
+                ver = f"{match.group(1)}{match.group(2)}"
+                log.debug(f"PHP {ver} detected via apache config for {domain}")
+                return ver
+
+        # Method 2: PHP-FPM pool config listen directive
+        php_conf = f"/home/{user}/conf/web/{domain}/php-fpm.conf"
+        exit_code, content, _ = self.exec(f"cat {php_conf} 2>/dev/null", warn_on_error=False)
+        if exit_code == 0:
             match = re.search(r"listen\s*=\s*/run/php/php(\d+)\.(\d+)", content)
             if match:
-                return f"{match.group(1)}{match.group(2)}"
+                ver = f"{match.group(1)}{match.group(2)}"
+                log.debug(f"PHP {ver} detected via fpm pool for {domain}")
+                return ver
+            match = re.search(r"php(\d+)\.(\d+)-fpm", content)
+            if match:
+                ver = f"{match.group(1)}{match.group(2)}"
+                log.debug(f"PHP {ver} detected via fpm pool (alt) for {domain}")
+                return ver
 
-        # Method 3: Check running PHP-FPM version
+        # Method 3: Backend template name (only explicit versions)
+        detail = self.get_web_domain_detail(user, domain)
+        backend_tpl = detail.get("BACKEND", "") or detail.get("BACKEND_TPL", "") or ""
+        if backend_tpl:
+            for tpl_name, version in PHP_FPM_TEMPLATES.items():
+                if tpl_name in backend_tpl:
+                    log.debug(f"PHP {version} detected via backend template for {domain}")
+                    return version
+            match = re.search(r"PHP[-_]?(\d)[-_]?(\d)", backend_tpl)
+            if match:
+                ver = f"{match.group(1)}{match.group(2)}"
+                log.debug(f"PHP {ver} detected via template name for {domain}")
+                return ver
+
+        # Method 4: System default PHP
         exit_code, content, _ = self.exec("php -r 'echo PHP_VERSION;' 2>/dev/null", warn_on_error=False)
         if exit_code == 0 and content:
             parts = content.split(".")
             if len(parts) >= 2:
-                return f"{parts[0]}{parts[1]}"
+                ver = f"{parts[0]}{parts[1]}"
+                log.warning(f"PHP {ver} detected via system default for {domain} (may be wrong)")
+                return ver
 
         log.warning(f"Cannot detect PHP version for {domain}, using default 81")
         return "81"
