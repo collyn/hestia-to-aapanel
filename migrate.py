@@ -1,0 +1,764 @@
+#!/usr/bin/env python3
+"""
+HestiaCP → aaPanel Migration Tool
+
+Migrates websites, databases, SSL certificates, DNS records, mail accounts,
+and cron jobs from a HestiaCP server to an aaPanel Community server.
+
+Usage:
+    python migrate.py --config config.yaml              # Full migration
+    python migrate.py --config config.yaml --dry-run    # Preview only
+    python migrate.py --config config.yaml --resume     # Resume after interruption
+    python migrate.py --config config.yaml --rollback   # Remove migrated sites
+
+Requirements:
+    pip install -r requirements.txt
+"""
+
+import argparse
+import json
+import os
+import sys
+import tempfile
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import yaml
+
+from modules.utils import (
+    console,
+    log,
+    LOG_FILE,
+    MigrationState,
+    create_progress,
+    print_banner,
+    print_summary,
+    print_error_context,
+    print_success,
+)
+from modules.hestia import HestiaClient
+from modules.aapanel_api import AAPanelAPI, AAPanelAPIError
+from modules.aapanel_ssh import AAPanelSSH
+from modules.transfer import TransferManager
+from modules.transformers import DataTransformer
+
+
+# ======================================================================
+# Main Migrator Class
+# ======================================================================
+
+class HestiaToAAPanelMigrator:
+    """Orchestrates the complete migration workflow."""
+
+    def __init__(self, config_path: str):
+        self.config = self._load_config(config_path)
+        self.dry_run = self.config.get("migration", {}).get("dry_run", False)
+        self.state = MigrationState()
+
+        # Initialize components (lazy — connect when needed)
+        self.hestia: Optional[HestiaClient] = None
+        self.api: Optional[AAPanelAPI] = None
+        self.ssh: Optional[AAPanelSSH] = None
+        self.transfer_mgr: Optional[TransferManager] = None
+        self.transformer: Optional[DataTransformer] = None
+
+        # Local temp dir for intermediate files
+        self.local_tmp = Path(tempfile.mkdtemp(prefix="hestia2aa_"))
+
+    # ------------------------------------------------------------------
+    # Config
+    # ------------------------------------------------------------------
+
+    def _load_config(self, path: str) -> Dict[str, Any]:
+        """Load YAML configuration file."""
+        config_path = Path(path)
+        if not config_path.exists():
+            console.print(f"[red]Config file not found: {path}[/red]")
+            sys.exit(1)
+
+        with open(config_path) as f:
+            config = yaml.safe_load(f)
+
+        # Allow env var overrides
+        if os.getenv("AA_PANEL_API_KEY"):
+            config.setdefault("aapanel", {})["api_key"] = os.getenv("AA_PANEL_API_KEY")
+
+        return config
+
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
+
+    def setup(self):
+        """Initialize all connections and components."""
+        hestia_cfg = self.config["hestia"]
+        aapanel_cfg = self.config["aapanel"]
+        migration_cfg = self.config.get("migration", {})
+
+        # Detect if we're running on one of the servers
+        hestia_local = hestia_cfg.get("local", False)
+        aapanel_local = aapanel_cfg.get("local", False)
+
+        # Hestia client (local or SSH)
+        self.hestia = HestiaClient(
+            host=hestia_cfg.get("host", "localhost"),
+            port=hestia_cfg.get("port", 22),
+            user=hestia_cfg.get("user", "root"),
+            password=hestia_cfg.get("password"),
+            ssh_key=hestia_cfg.get("ssh_key"),
+            hestia_path=hestia_cfg.get("hestia_path", "/usr/local/hestia"),
+            tmp_dir=migration_cfg.get("hestia_tmp_dir", "/tmp/hestia_migration"),
+            local=hestia_local,
+        )
+
+        # aaPanel API client
+        # Auto-detect panel URL for local mode
+        panel_url = aapanel_cfg["panel_url"]
+        if aapanel_local:
+            panel_url = panel_url.replace("127.0.0.1", "localhost")
+            if "localhost" not in panel_url and "127.0.0.1" not in panel_url:
+                console.print(
+                    f"[yellow]Local mode: overriding panel_url to http://127.0.0.1:8888[/yellow]"
+                    f"[yellow] (was {panel_url})[/yellow]"
+                )
+                # Try to detect the actual port
+                panel_url = "http://127.0.0.1:8888"
+
+        self.api = AAPanelAPI(
+            panel_url=panel_url,
+            api_key=aapanel_cfg["api_key"],
+        )
+
+        # aaPanel SSH client (local or SSH)
+        self.ssh = AAPanelSSH(
+            host=aapanel_cfg.get("host", "localhost"),
+            port=aapanel_cfg.get("port", 22),
+            user=aapanel_cfg.get("user", "root"),
+            password=aapanel_cfg.get("password"),
+            ssh_key=aapanel_cfg.get("ssh_key"),
+            tmp_dir=migration_cfg.get("aapanel_tmp_dir", "/tmp/aapanel_migration"),
+            local=aapanel_local,
+        )
+
+        # Transfer manager
+        self.transfer_mgr = TransferManager(
+            hestia_host=hestia_cfg.get("host", "localhost"),
+            hestia_port=hestia_cfg.get("port", 22),
+            hestia_user=hestia_cfg.get("user", "root"),
+            hestia_ssh_key=hestia_cfg.get("ssh_key"),
+            hestia_local=hestia_local,
+            aapanel_host=aapanel_cfg.get("host", "localhost"),
+            aapanel_port=aapanel_cfg.get("port", 22),
+            aapanel_user=aapanel_cfg.get("user", "root"),
+            aapanel_ssh_key=aapanel_cfg.get("ssh_key"),
+            aapanel_local=aapanel_local,
+            method=migration_cfg.get("transfer_method", "rsync"),
+            max_workers=migration_cfg.get("parallel_workers", 4),
+        )
+
+        # Data transformer
+        self.transformer = DataTransformer(
+            php_mapping=self.config.get("php_mapping"),
+            domain_map=migration_cfg.get("domain_map"),
+            default_quota=self.config.get("mail", {}).get("default_quota", "5 GB"),
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 1: Extract
+    # ------------------------------------------------------------------
+
+    def phase_extract(self) -> List[Dict[str, Any]]:
+        """Extract all site data from HestiaCP server."""
+        console.print("\n[bold cyan]Phase 1: Extracting data from HestiaCP...[/bold cyan]")
+
+        self.hestia.connect()
+        try:
+            sites = self.hestia.extract_all()
+        finally:
+            self.hestia.disconnect()
+
+        # Apply exclusions
+        exclude_domains = set(
+            self.config.get("migration", {}).get("exclude_domains", [])
+        )
+        exclude_users = set(
+            self.config.get("migration", {}).get("exclude_users", [])
+        )
+
+        sites = [
+            s for s in sites
+            if s.get("domain") not in exclude_domains
+            and s.get("user") not in exclude_users
+        ]
+
+        # Filter out failed extractions
+        failed = [s for s in sites if s.get("status") == "extraction_failed"]
+        sites = [s for s in sites if s.get("status") != "extraction_failed"]
+
+        if failed:
+            console.print(f"[yellow]⚠ {len(failed)} sites failed extraction[/yellow]")
+            for f in failed:
+                console.print(f"  - {f['user']}/{f['domain']}: {f.get('error')}")
+
+        self.state.data["total_sites"] = len(sites)
+        self.state.data["started_at"] = datetime.now().isoformat()
+        self.state.data["current_phase"] = "extract_done"
+        self.state.save()
+
+        console.print(f"[green]✓ Extracted {len(sites)} sites successfully[/green]")
+        return sites
+
+    # ------------------------------------------------------------------
+    # Phase 2: Transfer files and databases
+    # ------------------------------------------------------------------
+
+    def phase_transfer(self, sites: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        """Transfer web files and database dumps from HestiaCP to local."""
+        console.print("\n[bold cyan]Phase 2: Transferring files and databases...[/bold cyan]")
+
+        if self.dry_run:
+            console.print("[yellow]DRY RUN: Skipping actual transfers[/yellow]")
+            return {}
+
+        # Reconnect Hestia for dump + archive creation
+        self.hestia.connect()
+
+        transfers = []
+        try:
+            for site in sites:
+                domain = site["domain"]
+                user = site["user"]
+                entry: Dict[str, Any] = {"domain": domain}
+
+                # Archive web files
+                try:
+                    archive_path, _ = self.hestia.archive_web_files(user, domain)
+                    entry["hestia_archive_path"] = archive_path
+                except Exception as e:
+                    log.error(f"Failed to archive {domain}: {e}")
+                    entry["hestia_archive_path"] = None
+
+                # Dump databases
+                dbs = site.get("databases", [])
+                if dbs and self.config.get("migration", {}).get("databases", True):
+                    db_dumps = []
+                    for db in dbs:
+                        db_name = db.get("DATABASE", db.get("database", ""))
+                        if not db_name:
+                            continue
+                        try:
+                            dump_path, _ = self.hestia.dump_database(db_name)
+                            db_dumps.append({"db_name": db_name, "dump_path": dump_path})
+                        except Exception as e:
+                            log.error(f"Failed to dump {db_name}: {e}")
+                    if db_dumps:
+                        entry["hestia_db_dump_path"] = db_dumps[0]["dump_path"]
+                        entry["_db_dumps"] = db_dumps
+
+                transfers.append(entry)
+        finally:
+            self.hestia.disconnect()
+
+        # Now transfer files locally
+        results = self.transfer_mgr.transfer_sites_batch(
+            transfers, str(self.local_tmp)
+        )
+
+        self.state.data["current_phase"] = "transfer_done"
+        self.state.save()
+
+        # Count success
+        success_count = sum(1 for r in results.values() if r.get("success"))
+        console.print(f"[green]✓ Transferred {success_count}/{len(results)} sites[/green]")
+        return results
+
+    # ------------------------------------------------------------------
+    # Phase 3: Import to aaPanel
+    # ------------------------------------------------------------------
+
+    def phase_import(
+        self,
+        sites: List[Dict[str, Any]],
+        transfer_results: Dict[str, Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Import sites, databases, SSL, mail, cron into aaPanel."""
+        console.print("\n[bold cyan]Phase 3: Importing to aaPanel...[/bold cyan]")
+
+        if not self.api.test_connection():
+            console.print("[red]Cannot connect to aaPanel API. Check config.[/red]")
+            return []
+
+        migration_cfg = self.config.get("migration", {})
+        do_databases = migration_cfg.get("databases", True)
+        do_ssl = migration_cfg.get("ssl_certificates", True)
+        do_mail = migration_cfg.get("mail_accounts", False)
+        do_cron = migration_cfg.get("cron_jobs", True)
+
+        results: List[Dict[str, Any]] = []
+
+        with create_progress() as progress:
+            task_id = progress.add_task(
+                "[cyan]Importing sites...", total=len(sites)
+            )
+
+            for site in sites:
+                domain = site["domain"]
+                mapped_domain = self.transformer.map_domain(domain)
+
+                # Skip already migrated
+                if self.state.is_migrated(mapped_domain):
+                    log.info(f"Skipping {mapped_domain} (already migrated)")
+                    progress.advance(task_id)
+                    continue
+
+                try:
+                    result = self._import_site(
+                        site,
+                        transfer_results.get(domain, {}),
+                        do_databases=do_databases,
+                        do_ssl=do_ssl,
+                        do_mail=do_mail,
+                        do_cron=do_cron,
+                    )
+                    results.append(result)
+
+                    if result.get("success"):
+                        self.state.mark_site_migrated(mapped_domain, result)
+                        print_success(mapped_domain, {
+                            "Site ID": result.get("site_id", "?"),
+                            "SSL": "✓" if result.get("ssl_deployed") else "✗",
+                            "DB": "✓" if result.get("db_created") else "✗",
+                        })
+                    else:
+                        self.state.mark_site_failed(mapped_domain, result.get("error", "unknown"))
+                        print_error_context(mapped_domain, result.get("error", "unknown"))
+
+                except Exception as e:
+                    log.exception(f"Unexpected error importing {domain}")
+                    results.append({"domain": mapped_domain, "success": False, "error": str(e)})
+                    self.state.mark_site_failed(mapped_domain, str(e))
+                    print_error_context(mapped_domain, str(e))
+
+                progress.advance(task_id)
+
+        self.state.data["current_phase"] = "import_done"
+        self.state.save()
+
+        return results
+
+    def _import_site(
+        self,
+        site: Dict[str, Any],
+        transfer: Dict[str, Any],
+        do_databases: bool = True,
+        do_ssl: bool = True,
+        do_mail: bool = False,
+        do_cron: bool = True,
+    ) -> Dict[str, Any]:
+        """Import a single site into aaPanel.
+
+        Steps:
+        1. Upload files to /www/wwwroot/{domain}/
+        2. Import databases
+        3. Create site via API
+        4. Add domain aliases
+        5. Deploy SSL
+        6. Setup mail accounts
+        7. Import cron jobs
+        """
+        domain = self.transformer.map_domain(site["domain"])
+        php_ver = self.transformer.map_php_version(site.get("php_version", "81"))
+        user = site.get("user", "unknown")
+        result: Dict[str, Any] = {
+            "domain": domain,
+            "success": False,
+            "site_id": None,
+            "db_created": False,
+            "ssl_deployed": False,
+            "mail_created": False,
+            "cron_imported": False,
+            "error": "",
+        }
+
+        # --- Step 1: Upload files ---
+        if not self.dry_run:
+            self.ssh.connect()
+            try:
+                web_root = self.ssh.create_web_root(domain)
+
+                # Upload files via SCP from local temp
+                archive_path = transfer.get("archive_local_path")
+                if archive_path and os.path.exists(archive_path):
+                    # Extract archive on aaPanel server
+                    remote_archive = f"{self.ssh.tmp_dir}/{os.path.basename(archive_path)}"
+                    self.ssh.ensure_dir(self.ssh.tmp_dir)
+
+                    # Upload (SCP or local cp depending on config)
+                    ok, err = self.transfer_mgr.transfer(
+                        archive_path, remote_archive,
+                        direction="upload",
+                        local=self.config.get("aapanel", {}).get("local", False),
+                    )
+                    if ok:
+                        # Extract tar.gz to web root
+                        self.ssh.exec(
+                            f"tar xzf {remote_archive} -C {web_root} --strip-components=1 2>/dev/null || "
+                            f"tar xzf {remote_archive} -C {web_root} 2>/dev/null"
+                        )
+                        self.ssh.exec(f"chown -R www:www {web_root} 2>/dev/null || true")
+                        log.info(f"Extracted web files to {web_root}")
+                    else:
+                        log.error(f"Failed to upload archive for {domain}: {err}")
+            finally:
+                self.ssh.disconnect()
+
+        # --- Step 2: Import database dumps ---
+        db_dump_path = transfer.get("db_dump_local_path")
+        if do_databases and db_dump_path and os.path.exists(db_dump_path) and not self.dry_run:
+            self.ssh.connect()
+            try:
+                dbs = site.get("databases", [])
+                if dbs:
+                    db_info = dbs[0]
+                    db_name = db_info.get("DATABASE", db_info.get("database", ""))
+                    # Upload dump
+                    remote_dump = f"{self.ssh.tmp_dir}/{os.path.basename(db_dump_path)}"
+                    self.ssh.ensure_dir(self.ssh.tmp_dir)
+                    ok, _ = self.transfer_mgr.transfer(
+                        db_dump_path, remote_dump,
+                        direction="upload",
+                        local=self.config.get("aapanel", {}).get("local", False),
+                    )
+                    if ok:
+                        self.ssh.import_mysql_dump(remote_dump, db_name)
+            finally:
+                self.ssh.disconnect()
+
+        # --- Step 3: Create site via API ---
+        if self.dry_run:
+            log.info(f"[DRY RUN] Would create site: {domain} (PHP {php_ver})")
+            result["site_id"] = 0  # fake
+        else:
+            aliases = [self.transformer.map_domain(a) for a in site.get("aliases", [])]
+
+            try:
+                api_result = self.api.add_site(
+                    domain=domain,
+                    path=f"/www/wwwroot/{domain}",
+                    php_version=php_ver,
+                    port=80,
+                    description=f"Migrated from HestiaCP (user: {user})",
+                    domain_aliases=aliases,
+                    create_db=False,  # DB created separately or already exists
+                    create_ftp=False,
+                )
+                site_id = api_result.get("siteId")
+                result["site_id"] = site_id
+                log.info(f"Created site: {domain} → siteId={site_id}")
+            except AAPanelAPIError as e:
+                # Check if site already exists
+                existing = self.api.get_site_by_domain(domain)
+                if existing:
+                    site_id = existing.get("id")
+                    result["site_id"] = site_id
+                    log.warning(f"Site {domain} already exists (id={site_id}), reusing")
+                else:
+                    result["error"] = f"AddSite failed: {e}"
+                    return result
+
+        site_id = result["site_id"]
+
+        # --- Step 4: Add domain aliases (if not done in AddSite) ---
+        # Already handled by AddSite with domainlist parameter
+
+        # --- Step 5: SSL ---
+        if do_ssl and site.get("has_ssl") and site.get("ssl_certs"):
+            ssl_certs = site["ssl_certs"]
+            cert_pem = ssl_certs.get("cert", "") or ssl_certs.get("pem", "")
+            key_pem = ssl_certs.get("key", "")
+
+            if cert_pem and key_pem and not self.dry_run:
+                try:
+                    # Deploy cert files via SSH
+                    self.ssh.connect()
+                    self.ssh.deploy_ssl_files(domain, cert_pem, key_pem)
+                    self.ssh.disconnect()
+
+                    # Register cert via API
+                    self.api.set_ssl(domain, key_pem, cert_pem)
+                    self.api.enable_ssl(domain)
+                    self.api.force_https(domain)
+                    result["ssl_deployed"] = True
+                    log.info(f"SSL deployed for {domain}")
+                except AAPanelAPIError as e:
+                    log.error(f"SSL deployment failed for {domain}: {e}")
+            elif self.dry_run:
+                log.info(f"[DRY RUN] Would deploy SSL for {domain}")
+
+        # --- Step 6: Mail accounts ---
+        if do_mail and site.get("mail_accounts"):
+            mail_accounts = self.transformer.transform_mail_accounts(
+                site["mail_accounts"], domain
+            )
+            for acc in mail_accounts:
+                if acc.get("suspended"):
+                    continue
+                if not self.dry_run:
+                    try:
+                        self.api.add_mailbox(
+                            email=acc["email"],
+                            password=acc["password"],
+                            full_name=acc["full_name"],
+                            quota=acc["quota"],
+                            is_admin=acc["is_admin"],
+                        )
+                    except AAPanelAPIError as e:
+                        log.error(f"Mailbox creation failed: {acc['email']}: {e}")
+            result["mail_created"] = True
+
+        # --- Step 7: Cron jobs ---
+        if do_cron and site.get("cron_jobs"):
+            jobs = self.transformer.transform_cron_jobs(site["cron_jobs"])
+            active_jobs = [j for j in jobs if not j.get("suspended")]
+            if active_jobs and not self.dry_run:
+                self.ssh.connect()
+                self.ssh.import_cron_jobs(active_jobs)
+                self.ssh.disconnect()
+                result["cron_imported"] = True
+
+        # --- Verify ---
+        checks = self.config.get("checks", {})
+        if checks.get("http_verify") and not self.dry_run:
+            self.ssh.connect()
+            try:
+                ok, code, err = self.ssh.http_check(
+                    domain,
+                    use_https=result.get("ssl_deployed", False),
+                    timeout=checks.get("http_timeout", 30),
+                )
+                result["http_verified"] = ok
+                result["http_code"] = code
+                if not ok:
+                    log.warning(f"HTTP check failed for {domain}: HTTP {code} - {err}")
+            finally:
+                self.ssh.disconnect()
+
+        if checks.get("ssl_verify") and result.get("ssl_deployed") and not self.dry_run:
+            self.ssh.connect()
+            try:
+                ssl_info = self.ssh.ssl_check(domain)
+                result["ssl_verified"] = ssl_info.get("valid", False)
+                result["ssl_expires"] = ssl_info.get("expires", "")
+            finally:
+                self.ssh.disconnect()
+
+        result["success"] = True
+        return result
+
+    # ------------------------------------------------------------------
+    # Rollback
+    # ------------------------------------------------------------------
+
+    def rollback(self):
+        """Remove all sites that were migrated (based on state file)."""
+        console.print("\n[bold red]Rollback: Removing migrated sites from aaPanel...[/bold red]")
+
+        if not self.api.test_connection():
+            console.print("[red]Cannot connect to aaPanel API[/red]")
+            return
+
+        migrated = self.state.data.get("migrated_sites", [])
+        if not migrated:
+            console.print("[yellow]No sites to rollback[/yellow]")
+            return
+
+        console.print(f"Found {len(migrated)} sites to remove")
+
+        for domain in migrated:
+            try:
+                existing = self.api.get_site_by_domain(domain)
+                if existing:
+                    site_id = existing.get("id")
+                    self.api.delete_site(
+                        site_id=site_id,
+                        domain=domain,
+                        delete_ftp=True,
+                        delete_db=True,
+                        delete_files=False,  # preserve files
+                    )
+                    console.print(f"[green]✓ Removed: {domain}[/green]")
+                else:
+                    console.print(f"[yellow]Site not found (already deleted?): {domain}[/yellow]")
+            except AAPanelAPIError as e:
+                console.print(f"[red]✗ Failed to remove {domain}: {e}[/red]")
+
+        self.state.data["migrated_sites"] = []
+        self.state.data["failed_sites"] = []
+        self.state.save()
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
+
+    def cleanup(self):
+        """Clean up temporary files."""
+        # Clean local temp
+        import shutil
+        if self.local_tmp.exists():
+            shutil.rmtree(self.local_tmp, ignore_errors=True)
+            log.info(f"Cleaned local temp: {self.local_tmp}")
+
+        # Clean remote temps (best effort)
+        try:
+            self.hestia.connect()
+            self.hestia.cleanup_temp()
+            self.hestia.disconnect()
+        except Exception:
+            pass
+
+        try:
+            self.ssh.connect()
+            self.ssh.cleanup_temp()
+            self.ssh.disconnect()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Main entry
+    # ------------------------------------------------------------------
+
+    def run(self, resume: bool = False, rollback: bool = False):
+        """Run the full migration workflow."""
+        print_banner()
+
+        if rollback:
+            self.setup()
+            self.rollback()
+            return
+
+        if resume:
+            console.print("[cyan]Resuming from previous state...[/cyan]")
+            if self.state.data["total_sites"] == 0:
+                console.print("[yellow]No previous state found, starting fresh[/yellow]")
+
+        self.setup()
+
+        try:
+            # Phase 1: Extract
+            sites = self.phase_extract()
+            if not sites:
+                console.print("[yellow]No sites to migrate[/yellow]")
+                return
+
+            # Show preview
+            console.print("\n[bold]Sites to migrate:[/bold]")
+            for s in sites:
+                ssl_mark = "🔒" if s.get("has_ssl") else "  "
+                db_count = len(s.get("databases", []))
+                alias_count = len(s.get("aliases", []))
+                console.print(
+                    f"  {ssl_mark} [cyan]{s['domain']}[/cyan] "
+                    f"(PHP {s.get('php_version', '?')}, "
+                    f"{db_count} DB(s), {alias_count} alias(es))"
+                )
+
+            if self.dry_run:
+                console.print("\n[yellow]DRY RUN — no changes will be made[/yellow]")
+                console.print("[yellow]Add --no-dry-run to config to perform actual migration[/yellow]")
+                return
+
+            # Confirmation prompt
+            if not self.dry_run:
+                console.print(
+                    f"\n[yellow]About to migrate {len(sites)} sites from "
+                    f"{self.config['hestia']['host']} → {self.config['aapanel']['host']}[/yellow]"
+                )
+                confirm = input("Proceed? [y/N]: ").strip().lower()
+                if confirm not in ("y", "yes"):
+                    console.print("[red]Aborted[/red]")
+                    return
+
+            # Phase 2: Transfer
+            transfer_results = self.phase_transfer(sites)
+
+            # Phase 3: Import
+            results = self.phase_import(sites, transfer_results)
+
+            # Summary
+            print_summary(self.state)
+
+            succeeded = sum(1 for r in results if r.get("success"))
+            failed = sum(1 for r in results if not r.get("success"))
+            console.print(f"\n[bold green]Migration complete: {succeeded} succeeded, {failed} failed[/bold green]")
+            console.print(f"Log file: {LOG_FILE}")
+
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Interrupted. State saved — use --resume to continue[/yellow]")
+            self.state.save()
+        except Exception as e:
+            log.exception("Fatal error")
+            console.print(f"\n[red]Fatal error: {e}[/red]")
+            console.print(f"State saved. Log: {LOG_FILE}")
+            self.state.save()
+        finally:
+            self.cleanup()
+
+
+# ======================================================================
+# CLI
+# ======================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="HestiaCP → aaPanel Migration Tool",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python migrate.py --config config.yaml
+  python migrate.py --config config.yaml --dry-run
+  python migrate.py --config config.yaml --resume
+  python migrate.py --config config.yaml --rollback
+        """,
+    )
+    parser.add_argument(
+        "--config", "-c",
+        required=True,
+        help="Path to config.yaml file",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview only, no actual changes",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from previous interrupted run",
+    )
+    parser.add_argument(
+        "--rollback",
+        action="store_true",
+        help="Remove all migrated sites from aaPanel",
+    )
+
+    args = parser.parse_args()
+
+    # Validate config path
+    if not Path(args.config).exists():
+        console.print(f"[red]Config file not found: {args.config}[/red]")
+        sys.exit(1)
+
+    migrator = HestiaToAAPanelMigrator(args.config)
+
+    if args.dry_run:
+        migrator.dry_run = True
+
+    migrator.run(
+        resume=args.resume,
+        rollback=args.rollback,
+    )
+
+
+if __name__ == "__main__":
+    main()

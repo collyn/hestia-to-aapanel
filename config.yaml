@@ -1,0 +1,97 @@
+# ============================================================
+# HestiaCP → aaPanel Migration Configuration
+# ============================================================
+
+# --- Source: HestiaCP Server ---
+hestia:
+  # Set local: true if this script is running ON the HestiaCP server itself
+  # (skip SSH, run commands directly). Default: false (remote SSH).
+  local: false
+  host: "192.168.1.10"           # HestiaCP server IP/hostname (ignored if local=true)
+  port: 22                        # SSH port (ignored if local=true)
+  user: "root"                    # SSH user (ignored if local=true)
+  ssh_key: "~/.ssh/id_rsa"       # Path to SSH private key (ignored if local=true)
+  # password: "..."               # Or use password instead of ssh_key
+  hestia_path: "/usr/local/hestia"  # HestiaCP install path
+
+# --- Target: aaPanel Server ---
+aapanel:
+  # Set local: true if this script is running ON the aaPanel server itself
+  # (skip SSH, run file ops + commands directly). Default: false (remote SSH).
+  local: false
+  host: "192.168.1.20"           # aaPanel server IP/hostname (ignored if local=true)
+  port: 22                        # SSH port (ignored if local=true)
+  user: "root"                    # SSH user (ignored if local=true)
+  ssh_key: "~/.ssh/id_rsa"       # Path to SSH private key (ignored if local=true)
+  # password: "..."               # Or use password instead of ssh_key
+  panel_url: "http://192.168.1.20:8888"  # aaPanel web panel URL (use http://127.0.0.1:8888 if local=true)
+  api_key: "YOUR_AA_PANEL_API_KEY"       # From Settings → API in aaPanel
+
+# --- Migration Options ---
+migration:
+  # What to migrate (true/false)
+  websites: true
+  databases: true
+  ssl_certificates: true
+  dns_records: false              # aaPanel has no built-in DNS; only if DNS plugin installed
+  mail_accounts: false            # Requires Mail Server plugin in aaPanel
+  cron_jobs: true
+
+  # File transfer method: "rsync" or "scp"
+  transfer_method: "rsync"
+
+  # Path to temporary directory for dumps/archives on Hestia server
+  hestia_tmp_dir: "/tmp/hestia_migration"
+
+  # Path to temporary directory for receiving files on aaPanel server
+  aapanel_tmp_dir: "/tmp/aapanel_migration"
+
+  # Max parallel transfers (files + db dumps)
+  parallel_workers: 4
+
+  # Dry run: preview only, no actual changes
+  dry_run: false
+
+  # Site name prefix/suffix for aaPanel (optional)
+  # site_name_prefix: "migrated_"
+
+  # Exclude specific domains/users from migration
+  # exclude_domains:
+  #   - "test.example.com"
+  # exclude_users:
+  #   - "admin"
+
+  # Domain mapping: override domain names (old → new)
+  # domain_map:
+  #   "old-domain.com": "new-domain.com"
+
+# --- PHP Version Mapping ---
+# Map Hestia PHP-FPM socket versions → aaPanel PHP version numbers
+php_mapping:
+  "7.4": "74"
+  "8.0": "80"
+  "8.1": "81"
+  "8.2": "82"
+  "8.3": "83"
+  "8.4": "84"
+  default: "81"  # Default PHP version if detection fails
+
+# --- DNS ---
+dns:
+  # Strategy: "skip" | "plugin" (aaPanel DNS Manager plugin)
+  strategy: "skip"
+  # plugin_endpoint: "http://..."  # Custom DNS plugin API if needed
+
+# --- Mail ---
+mail:
+  # Strategy: "skip" | "plugin" (aaPanel Mail Server plugin)
+  strategy: "skip"
+  # Default mailbox quota
+  default_quota: "5 GB"
+
+# --- Post-Migration Checks ---
+checks:
+  http_verify: true               # Curl each domain, verify HTTP 200
+  ssl_verify: true                # Verify SSL cert validity
+  db_verify: true                 # Test database connections
+  http_timeout: 30                # Seconds to wait for HTTP response

@@ -1,0 +1,515 @@
+"""
+HestiaCP data extraction via SSH or local execution.
+
+Supports two modes:
+- SSH mode: connects to a remote HestiaCP server over SSH
+- Local mode: runs v-* CLI commands directly (when script runs on the HestiaCP server)
+"""
+
+import json
+import re
+import subprocess
+import tempfile
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from .utils import log, console
+
+# paramiko is optional (only needed for SSH mode)
+try:
+    import paramiko
+    HAS_PARAMIKO = True
+except ImportError:
+    HAS_PARAMIKO = False
+
+# ---------------------------------------------------------------------------
+# Known HestiaCP web server templates and their PHP versions
+# ---------------------------------------------------------------------------
+PHP_FPM_TEMPLATES = {
+    "PHP-7_4": "74",
+    "PHP-8_0": "80",
+    "PHP-8_1": "81",
+    "PHP-8_2": "82",
+    "PHP-8_3": "83",
+    "PHP-8_4": "84",
+    "default": "74",
+    "hosting": "74",
+}
+
+
+class HestiaClient:
+    """Client wrapper for HestiaCP server (SSH or local)."""
+
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 22,
+        user: str = "root",
+        password: Optional[str] = None,
+        ssh_key: Optional[str] = None,
+        hestia_path: str = "/usr/local/hestia",
+        tmp_dir: str = "/tmp/hestia_migration",
+        local: bool = False,
+    ):
+        self.host = host
+        self.port = port
+        self.user = user
+        self.password = password
+        self.ssh_key = Path(ssh_key).expanduser() if ssh_key else None
+        self.hestia_path = Path(hestia_path)
+        self.bin_path = self.hestia_path / "bin"
+        self.tmp_dir = tmp_dir
+        self.local = local
+        self._client = None  # paramiko SSHClient (only when local=False)
+        self._sftp = None     # paramiko SFTPClient (only when local=False)
+
+    # ------------------------------------------------------------------
+    # Connection management
+    # ------------------------------------------------------------------
+
+    def connect(self):
+        """Establish SSH connection (no-op in local mode)."""
+        if self.local:
+            # Verify we can access Hestia bin path locally
+            if not self.bin_path.exists():
+                raise RuntimeError(
+                    f"HestiaCP bin path not found: {self.bin_path}. "
+                    "Are you sure this is a HestiaCP server? "
+                    "Set hestia.local=false to use remote SSH."
+                )
+            log.info(f"Local mode: using HestiaCP at {self.hestia_path}")
+            return
+
+        if not HAS_PARAMIKO:
+            raise RuntimeError("paramiko is required for SSH mode. Install: pip install paramiko")
+
+        self._client = paramiko.SSHClient()
+        self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+        connect_kwargs: Dict[str, Any] = {
+            "hostname": self.host,
+            "port": self.port,
+            "username": self.user,
+            "timeout": 30,
+        }
+
+        if self.password:
+            connect_kwargs["password"] = self.password
+        elif self.ssh_key and self.ssh_key.exists():
+            connect_kwargs["key_filename"] = str(self.ssh_key)
+        else:
+            connect_kwargs["allow_agent"] = True
+
+        try:
+            self._client.connect(**connect_kwargs)
+            self._sftp = self._client.open_sftp()
+            log.info(f"Connected to HestiaCP server: {self.host}:{self.port}")
+        except Exception as e:
+            log.error(f"Failed to connect to HestiaCP server: {e}")
+            raise
+
+    def disconnect(self):
+        """Close SSH connection (no-op in local mode)."""
+        if self.local:
+            return
+        if self._sftp:
+            self._sftp.close()
+        if self._client:
+            self._client.close()
+        log.info("Disconnected from HestiaCP server")
+
+    def __enter__(self):
+        self.connect()
+        return self
+
+    def __exit__(self, *args):
+        self.disconnect()
+
+    # ------------------------------------------------------------------
+    # Raw command execution
+    # ------------------------------------------------------------------
+
+    def exec(self, command: str, timeout: int = 120) -> Tuple[int, str, str]:
+        """Execute a command. Uses local subprocess or SSH depending on mode.
+        Returns (exit_code, stdout, stderr).
+        """
+        log.debug(f"Exec ({'local' if self.local else 'ssh'}): {command[:120]}...")
+
+        if self.local:
+            try:
+                result = subprocess.run(
+                    command,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+                out = result.stdout.strip()
+                err = result.stderr.strip()
+                code = result.returncode
+            except subprocess.TimeoutExpired:
+                code, out, err = 124, "", "Command timed out"
+            except Exception as e:
+                code, out, err = 1, "", str(e)
+        else:
+            if self._client is None:
+                raise RuntimeError("Not connected. Call connect() first.")
+            stdin, stdout, stderr = self._client.exec_command(command, timeout=timeout)
+            code = stdout.channel.recv_exit_status()
+            out = stdout.read().decode("utf-8", errors="replace")
+            err = stderr.read().decode("utf-8", errors="replace")
+
+        if code != 0:
+            log.warning(f"Command exited {code}: {command[:100]}")
+            if err:
+                log.warning(f"stderr: {err[:300]}")
+
+        return code, out, err
+
+    def exec_json(self, command: str, timeout: int = 120) -> Dict[str, Any]:
+        """Execute a v-* command with 'json' format and return parsed result."""
+        exit_code, stdout, stderr = self.exec(command, timeout)
+        if exit_code != 0:
+            log.error(f"Command failed: {command}\n{stderr}")
+            return {}
+        try:
+            return json.loads(stdout) if stdout else {}
+        except json.JSONDecodeError:
+            log.warning(f"Non-JSON output from: {command[:100]}")
+            log.debug(f"Output: {stdout[:500]}")
+            return {}
+
+    # ------------------------------------------------------------------
+    # Data extraction
+    # ------------------------------------------------------------------
+
+    def get_users(self) -> List[str]:
+        """List all HestiaCP users."""
+        result = self.exec_json(f"{self.bin_path}/v-list-users json")
+        if isinstance(result, list):
+            return [u for u in result if u not in ("admin",)]
+        if isinstance(result, dict):
+            return [k for k in result.keys() if k not in ("admin",)]
+        return []
+
+    def get_web_domains(self, user: str) -> List[str]:
+        """List all web domains for a given user."""
+        result = self.exec_json(f"{self.bin_path}/v-list-web-domains {user} json")
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            return list(result.keys())
+        return []
+
+    def get_web_domain_detail(self, user: str, domain: str) -> Dict[str, Any]:
+        """Get detailed info for a specific web domain."""
+        return self.exec_json(f"{self.bin_path}/v-list-web-domain {user} {domain} json")
+
+    def get_databases(self, user: str) -> List[Dict[str, Any]]:
+        """List all databases for a user."""
+        result = self.exec_json(f"{self.bin_path}/v-list-databases {user} json")
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            return [{"DATABASE": k, **v} for k, v in result.items()]
+        return []
+
+    def get_dns_domains(self, user: str) -> List[str]:
+        """List all DNS domains for a user."""
+        result = self.exec_json(f"{self.bin_path}/v-list-dns-domains {user} json")
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            return list(result.keys())
+        return []
+
+    def get_dns_records(self, user: str, domain: str) -> List[Dict[str, Any]]:
+        """Get all DNS records for a domain."""
+        result = self.exec_json(f"{self.bin_path}/v-list-dns-records {user} {domain} json")
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            return list(result.values())
+        return []
+
+    def get_mail_domains(self, user: str) -> List[str]:
+        """List all mail domains for a user."""
+        result = self.exec_json(f"{self.bin_path}/v-list-mail-domains {user} json")
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            return list(result.keys())
+        return []
+
+    def get_mail_accounts(self, user: str, domain: str) -> List[Dict[str, Any]]:
+        """Get all mail accounts for a domain."""
+        result = self.exec_json(f"{self.bin_path}/v-list-mail-accounts {user} {domain} json")
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            return list(result.values())
+        return []
+
+    def get_cron_jobs(self, user: str) -> List[Dict[str, Any]]:
+        """List all cron jobs for a user."""
+        result = self.exec_json(f"{self.bin_path}/v-list-cron-jobs {user} json")
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            return list(result.values())
+        return []
+
+    def get_system_ips(self) -> Dict[str, Any]:
+        """Get system IP configuration."""
+        return self.exec_json(f"{self.bin_path}/v-list-sys-ips json")
+
+    # ------------------------------------------------------------------
+    # File system operations
+    # ------------------------------------------------------------------
+
+    def get_mysql_admin_credentials(self) -> Dict[str, str]:
+        """Read MySQL admin credentials from HestiaCP config."""
+        mysql_conf = "/usr/local/hestia/conf/mysql.conf"
+        exit_code, content, _ = self.exec(f"cat {mysql_conf}")
+        if exit_code != 0:
+            log.error("Cannot read MySQL config")
+            return {}
+
+        creds = {}
+        for line in content.split("\n"):
+            match = re.match(r"(\w+)='(.*)'", line.strip())
+            if match:
+                creds[match.group(1).lower()] = match.group(2)
+
+        return creds
+
+    def detect_php_version(self, user: str, domain: str) -> str:
+        """Detect PHP version from HestiaCP config files.
+
+        Checks the PHP-FPM backend template name and the socket path.
+        """
+        # Method 1: Check backend template from web config
+        detail = self.get_web_domain_detail(user, domain)
+        backend_tpl = detail.get("BACKEND", "") or detail.get("BACKEND_TPL", "") or ""
+
+        if backend_tpl:
+            for tpl_name, version in PHP_FPM_TEMPLATES.items():
+                if tpl_name in backend_tpl:
+                    return version
+            # If template name contains PHP version directly
+            match = re.search(r"PHP[-_]?(\d)[-_]?(\d)", backend_tpl)
+            if match:
+                return f"{match.group(1)}{match.group(2)}"
+
+        # Method 2: Check PHP-FPM socket
+        php_conf = f"/home/{user}/conf/web/{domain}/php-fpm.conf"
+        exit_code, content, _ = self.exec(f"cat {php_conf} 2>/dev/null")
+        if exit_code == 0:
+            match = re.search(r"php(\d+)\.(\d+)-fpm", content)
+            if match:
+                return f"{match.group(1)}{match.group(2)}"
+            # Alternative: check listen socket
+            match = re.search(r"listen\s*=\s*/run/php/php(\d+)\.(\d+)", content)
+            if match:
+                return f"{match.group(1)}{match.group(2)}"
+
+        # Method 3: Check running PHP-FPM version
+        exit_code, content, _ = self.exec("php -r 'echo PHP_VERSION;' 2>/dev/null")
+        if exit_code == 0 and content:
+            parts = content.split(".")
+            if len(parts) >= 2:
+                return f"{parts[0]}{parts[1]}"
+
+        log.warning(f"Cannot detect PHP version for {domain}, using default 81")
+        return "81"
+
+    def get_web_root(self, user: str, domain: str) -> str:
+        """Get the web document root for a domain."""
+        return f"/home/{user}/web/{domain}/public_html/"
+
+    def get_ssl_cert_paths(self, user: str, domain: str) -> Dict[str, str]:
+        """Get SSL certificate file paths for a domain."""
+        ssl_dir = f"/home/{user}/conf/web/{domain}/ssl/"
+        return {
+            "cert": f"{ssl_dir}{domain}.crt",
+            "key": f"{ssl_dir}{domain}.key",
+            "ca": f"{ssl_dir}{domain}.ca",
+            "pem": f"{ssl_dir}{domain}.pem",
+        }
+
+    def ssl_exists(self, user: str, domain: str) -> bool:
+        """Check if SSL certificates exist for a domain."""
+        paths = self.get_ssl_cert_paths(user, domain)
+        exit_code, stdout, _ = self.exec(f"test -f {paths['cert']} && test -f {paths['key']} && echo OK")
+        return exit_code == 0 and "OK" in stdout
+
+    def read_ssl_cert(self, user: str, domain: str) -> Dict[str, str]:
+        """Read SSL certificate and key contents."""
+        paths = self.get_ssl_cert_paths(user, domain)
+        result = {}
+        for name, path in paths.items():
+            exit_code, content, _ = self.exec(f"cat {path} 2>/dev/null")
+            if exit_code == 0 and content:
+                result[name] = content
+        return result
+
+    def get_domain_aliases(self, user: str, domain: str) -> List[str]:
+        """Get domain aliases from web domain detail."""
+        detail = self.get_web_domain_detail(user, domain)
+        aliases_str = detail.get("ALIAS", "")
+        if not aliases_str or aliases_str == "none":
+            return []
+        return [a.strip() for a in aliases_str.split(",") if a.strip()]
+
+    # ------------------------------------------------------------------
+    # Database dump
+    # ------------------------------------------------------------------
+
+    def dump_database(
+        self,
+        db_name: str,
+        output_path: Optional[str] = None,
+    ) -> Tuple[str, str]:
+        """Dump a MySQL database using mysqldump.
+
+        Returns (local_dump_path, dump_filename).
+        """
+        creds = self.get_mysql_admin_credentials()
+        db_user = creds.get("user", "root")
+        db_pass = creds.get("password", "")
+
+        filename = f"{db_name}_{datetime.now():%Y%m%d_%H%M%S}.sql"
+        remote_path = f"{self.tmp_dir}/{filename}"
+
+        # Create tmp dir if not exists
+        self.exec(f"mkdir -p {self.tmp_dir}")
+
+        dump_cmd = (
+            f"mysqldump -u{db_user} -p'{db_pass}' "
+            f"--single-transaction --routines --triggers "
+            f"--add-drop-table --extended-insert "
+            f"{db_name} > {remote_path}"
+        )
+
+        exit_code, stdout, stderr = self.exec(dump_cmd, timeout=600)
+        if exit_code != 0:
+            raise RuntimeError(f"mysqldump failed for {db_name}: {stderr}")
+
+        log.info(f"Dumped database: {db_name} → {remote_path}")
+        return remote_path, filename
+
+    # ------------------------------------------------------------------
+    # Web files archive
+    # ------------------------------------------------------------------
+
+    def archive_web_files(
+        self,
+        user: str,
+        domain: str,
+    ) -> Tuple[str, str]:
+        """Create a tar.gz archive of web files.
+
+        Returns (remote_tar_path, tar_filename).
+        """
+        web_root = f"/home/{user}/web/{domain}/"
+        config_dir = f"/home/{user}/conf/web/{domain}/"
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{domain}_{timestamp}.tar.gz"
+        remote_path = f"{self.tmp_dir}/{filename}"
+
+        self.exec(f"mkdir -p {self.tmp_dir}")
+
+        # Archive web files + configs in one tarball
+        tar_cmd = (
+            f"tar czf {remote_path} "
+            f"-C /home/{user}/web {domain}/ "
+            f"-C /home/{user}/conf/web {domain}/ "
+            f"2>/dev/null"
+        )
+        exit_code, _, stderr = self.exec(tar_cmd, timeout=300)
+        if exit_code != 0:
+            log.warning(f"tar warning for {domain}: {stderr}")
+
+        log.info(f"Archived web files: {domain} → {remote_path}")
+        return remote_path, filename
+
+    def cleanup_temp(self):
+        """Remove temporary files on Hestia server."""
+        self.exec(f"rm -rf {self.tmp_dir}")
+
+    # ------------------------------------------------------------------
+    # Full site extraction
+    # ------------------------------------------------------------------
+
+    def extract_all(self) -> List[Dict[str, Any]]:
+        """Extract complete data for all websites.
+
+        Returns a list of site data dicts ready for migration.
+        """
+        users = self.get_users()
+        log.info(f"Found {len(users)} HestiaCP users: {users}")
+
+        all_sites: List[Dict[str, Any]] = []
+
+        for user in users:
+            domains = self.get_web_domains(user)
+            log.info(f"User '{user}': {len(domains)} domains")
+
+            for domain in domains:
+                try:
+                    site_data = self._extract_site(user, domain)
+                    all_sites.append(site_data)
+                except Exception as e:
+                    log.error(f"Failed to extract {user}/{domain}: {e}")
+                    all_sites.append({
+                        "user": user,
+                        "domain": domain,
+                        "error": str(e),
+                        "status": "extraction_failed",
+                    })
+
+        log.info(f"Extracted {len(all_sites)} sites total")
+        return all_sites
+
+    def _extract_site(self, user: str, domain: str) -> Dict[str, Any]:
+        """Extract all data for one site."""
+        log.info(f"Extracting: {user} / {domain}")
+
+        domain_detail = self.get_web_domain_detail(user, domain)
+        php_version = self.detect_php_version(user, domain)
+        aliases = self.get_domain_aliases(user, domain)
+        has_ssl = self.ssl_exists(user, domain)
+        ip = domain_detail.get("IP", "") if isinstance(domain_detail, dict) else ""
+
+        # Detect web server type
+        proxy_tpl = domain_detail.get("PROXY", "") if isinstance(domain_detail, dict) else ""
+        tpl = domain_detail.get("TPL", "") if isinstance(domain_detail, dict) else ""
+        web_type = "PHP"
+        if proxy_tpl and "nginx" in proxy_tpl.lower():
+            web_type = "PHP"  # nginx proxy → PHP backend
+
+        site: Dict[str, Any] = {
+            "user": user,
+            "domain": domain,
+            "aliases": aliases,
+            "php_version": php_version,
+            "web_type": web_type,
+            "ip": ip,
+            "has_ssl": has_ssl,
+            "web_root": self.get_web_root(user, domain),
+            "domain_detail": domain_detail,
+            # Databases
+            "databases": self.get_databases(user),
+            # DNS (optional)
+            "dns_records": [] if not self.get_dns_domains(user) else self.get_dns_records(user, domain) if domain in self.get_dns_domains(user) else [],
+            # Mail (optional)
+            "mail_accounts": [] if domain not in self.get_mail_domains(user) else self.get_mail_accounts(user, domain),
+            # Cron
+            "cron_jobs": self.get_cron_jobs(user),
+            # SSL cert content
+            "ssl_certs": self.read_ssl_cert(user, domain) if has_ssl else {},
+        }
+
+        return site
