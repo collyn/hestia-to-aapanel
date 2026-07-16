@@ -192,11 +192,10 @@ class HestiaToAAPanelMigrator:
 
     def _save_sites_cache(self, sites: List[Dict[str, Any]]):
         """Save extracted sites to cache file (without SSL cert content — too large)."""
-        # Strip large binary fields before caching
+        # Keep ssl_certs — they're small text (PEM), needed for Phase 3
         cache_data = []
         for s in sites:
-            entry = {k: v for k, v in s.items() if k != "ssl_certs"}
-            cache_data.append(entry)
+            cache_data.append(s)
 
         path = self._sites_cache_path()
         with open(path, "w") as f:
@@ -727,8 +726,18 @@ class HestiaToAAPanelMigrator:
         # --- Step 4: Add domain aliases ---
 
         # --- Step 5: SSL ---
-        if do_ssl and site.get("has_ssl") and site.get("ssl_certs"):
-            ssl_certs = site["ssl_certs"]
+        if do_ssl and site.get("has_ssl"):
+            ssl_certs = site.get("ssl_certs", {})
+            # If cached data is missing cert content (stripped from old cache), re-read
+            if not ssl_certs or not ssl_certs.get("cert"):
+                log.info(f"Re-reading SSL certs for {domain} (not in cache)...")
+                self.hestia.connect()
+                try:
+                    ssl_certs = self.hestia.read_ssl_cert(site["user"], site["domain"])
+                finally:
+                    self.hestia.disconnect()
+                # Update site data for future use
+                site["ssl_certs"] = ssl_certs
             cert_pem = ssl_certs.get("cert", "") or ssl_certs.get("pem", "")
             key_pem = ssl_certs.get("key", "")
 
