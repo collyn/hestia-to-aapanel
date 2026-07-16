@@ -467,11 +467,10 @@ class HestiaToAAPanelMigrator:
                 domain = site["domain"]
                 mapped_domain = self.transformer.map_domain(domain)
 
-                # Skip already migrated (but not failed ones if retrying)
-                if self.state.is_migrated(mapped_domain):
+                # Skip already migrated (unless --force or --retry-failed)
+                if self.state.is_migrated(mapped_domain) and not force:
                     if retry_failed and self.state.is_failed(mapped_domain):
                         log.info(f"Retrying failed site: {mapped_domain}")
-                        # Remove from failed list so it can be re-processed
                         if mapped_domain in self.state.data["failed_sites"]:
                             self.state.data["failed_sites"].remove(mapped_domain)
                         self.state.save()
@@ -871,7 +870,7 @@ class HestiaToAAPanelMigrator:
     # Main entry
     # ------------------------------------------------------------------
 
-    def run(self, resume: bool = False, rollback: bool = False, retry_failed: bool = False):
+    def run(self, resume: bool = False, rollback: bool = False, retry_failed: bool = False, force: bool = False):
         """Run the full migration workflow."""
         print_banner()
 
@@ -995,6 +994,11 @@ Examples:
         action="store_true",
         help="Retry sites that failed in a previous run",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Ignore state cache and re-import ALL sites (even previously migrated ones)",
+    )
 
     args = parser.parse_args()
 
@@ -1012,6 +1016,7 @@ Examples:
         resume=args.resume,
         rollback=args.rollback,
         retry_failed=args.retry_failed,
+        force=args.force,
     )
 
 
