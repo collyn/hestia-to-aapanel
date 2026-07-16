@@ -9,11 +9,15 @@ Let's Encrypt automation, and mail plugin calls.
 import hashlib
 import json
 import time
+import urllib3
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
 from .utils import log, console
+
+# aaPanel uses self-signed certificates by default — suppress warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 class AAPanelAPIError(Exception):
@@ -34,6 +38,7 @@ class AAPanelAPI:
         self.api_key = api_key
         self.timeout = timeout
         self._session = requests.Session()
+        self._session.verify = False  # aaPanel uses self-signed certs
         self._session.headers.update({
             "User-Agent": "HestiaCP-Migration-Tool/1.0",
             "Accept": "application/json",

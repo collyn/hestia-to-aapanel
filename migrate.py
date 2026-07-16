@@ -115,17 +115,17 @@ class HestiaToAAPanelMigrator:
         # aaPanel API client
         panel_url = aapanel_cfg["panel_url"]
         if aapanel_local:
-            # Only override to localhost if user didn't already set a local URL
+            from urllib.parse import urlparse
+            parsed = urlparse(panel_url)
+            # Preserve the scheme (http/https) from user's config
+            scheme = parsed.scheme or "https"
+            port = parsed.port or 8888
+
             if "127.0.0.1" in panel_url or "localhost" in panel_url:
                 pass  # User already configured local URL — keep it
             else:
-                # User configured a remote URL but we're local — try to use localhost
-                # with the same port from the user's config
-                from urllib.parse import urlparse
-                parsed = urlparse(panel_url)
-                port = parsed.port or 8888
-                panel_url = f"http://127.0.0.1:{port}"
-                console.print(f"[cyan]Local mode: using {panel_url} (from your config port {port})[/cyan]")
+                panel_url = f"{scheme}://127.0.0.1:{port}"
+                console.print(f"[cyan]Local mode: using {panel_url} (scheme={scheme}, port={port})[/cyan]")
 
         self.api = AAPanelAPI(
             panel_url=panel_url,
@@ -417,10 +417,13 @@ class HestiaToAAPanelMigrator:
 
                 # Auto-detect port if default didn't work
                 detected_port = self.ssh.detect_panel_port()
-                if detected_port and detected_port != 8888:
+                if detected_port:
+                    # Preserve scheme from original config
+                    from urllib.parse import urlparse
+                    scheme = urlparse(self.config["aapanel"]["panel_url"]).scheme or "https"
                     old_url = self.api.panel_url
-                    self.api.panel_url = f"http://127.0.0.1:{detected_port}"
-                    console.print(f"[cyan]Auto-detected aaPanel port: {detected_port}[/cyan]")
+                    self.api.panel_url = f"{scheme}://127.0.0.1:{detected_port}"
+                    console.print(f"[cyan]Auto-detected aaPanel: {self.api.panel_url}[/cyan]")
             finally:
                 self.ssh.disconnect()
 
@@ -432,10 +435,12 @@ class HestiaToAAPanelMigrator:
                 try:
                     port = self.ssh.detect_panel_port()
                     if port:
-                        self.api.panel_url = f"http://127.0.0.1:{port}"
-                        console.print(f"[cyan]Retrying with port {port}...[/cyan]")
+                        from urllib.parse import urlparse
+                        scheme = urlparse(self.config["aapanel"]["panel_url"]).scheme or "https"
+                        self.api.panel_url = f"{scheme}://127.0.0.1:{port}"
+                        console.print(f"[cyan]Retrying with {self.api.panel_url}...[/cyan]")
                         if self.api.test_connection():
-                            console.print(f"[green]Connected! Using port {port}[/green]")
+                            console.print(f"[green]Connected! Using {self.api.panel_url}[/green]")
                 finally:
                     self.ssh.disconnect()
 
