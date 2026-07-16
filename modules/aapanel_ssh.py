@@ -249,12 +249,15 @@ class AAPanelSSH:
             cs = "utf8mb4"
 
         # Build SQL file (avoids shell escaping of backticks and quotes)
+        # Use CREATE + ALTER to ensure password is always correct even if user exists
         sql = (
             f"CREATE DATABASE IF NOT EXISTS `{db_name}` "
             f"DEFAULT CHARACTER SET {cs} COLLATE {cs}_unicode_ci;\n"
             f"CREATE USER IF NOT EXISTS '{db_user}'@'%' IDENTIFIED BY '{db_password}';\n"
+            f"ALTER USER '{db_user}'@'%' IDENTIFIED BY '{db_password}';\n"
             f"GRANT ALL PRIVILEGES ON `{db_name}`.* TO '{db_user}'@'%';\n"
             f"GRANT ALL PRIVILEGES ON `{db_name}`.* TO '{db_user}'@'localhost';\n"
+            f"ALTER USER '{db_user}'@'localhost' IDENTIFIED BY '{db_password}';\n"
             f"FLUSH PRIVILEGES;\n"
         )
 
