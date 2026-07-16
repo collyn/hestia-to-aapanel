@@ -45,6 +45,7 @@ class AAPanelSSH:
         ssh_key: Optional[str] = None,
         tmp_dir: str = "/root/aapanel_migration_dumps",
         local: bool = False,
+        mysql_root_password: str = "",
     ):
         self.host = host
         self.port = port
@@ -53,6 +54,7 @@ class AAPanelSSH:
         self.ssh_key = Path(ssh_key).expanduser() if ssh_key else None
         self.tmp_dir = tmp_dir
         self.local = local
+        self.mysql_root_password = mysql_root_password
         self._client = None  # paramiko SSHClient (only when local=False)
         self._sftp = None     # paramiko SFTPClient (only when local=False)
 
@@ -188,8 +190,15 @@ class AAPanelSSH:
 
         Returns a prefix like 'mysql' or 'mysql -uroot -pXXX' that works.
         """
-        # Method 1: Try mysql without password (socket auth / root via sudo)
-        _, _, _ = self.exec("mysql -e 'SELECT 1' 2>/dev/null", warn_on_error=False)
+        # Method 0: Use explicit password from config
+        if self.mysql_root_password:
+            pw = self.mysql_root_password.replace("'", "'\\''")
+            return f"mysql -uroot -p'{pw}'"
+
+        # Method 1: Try mysql without password (socket auth)
+        code, _, _ = self.exec("mysql -e 'SELECT 1' 2>/dev/null", warn_on_error=False)
+        if code == 0:
+            return "mysql"
 
         # Method 2: Try with debian-sys-maint (Debian/Ubuntu default)
         debian_cnf = "/etc/mysql/debian.cnf"

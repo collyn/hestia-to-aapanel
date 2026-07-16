@@ -26,6 +26,9 @@ aapanel:
   # password: "..."               # Or use password instead of ssh_key
   panel_url: "http://192.168.1.20:8888"  # aaPanel web panel URL (use http://127.0.0.1:8888 if local=true)
   api_key: "YOUR_AA_PANEL_API_KEY"       # From Settings → API in aaPanel
+  # MySQL root credentials (used when API database creation fails)
+  # If not set, script will try auto-detection (socket, debian.cnf, etc.)
+  mysql_root_password: ""                 # MySQL root password
 
 # --- Migration Options ---
 migration:

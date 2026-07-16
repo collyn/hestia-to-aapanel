@@ -141,6 +141,7 @@ class HestiaToAAPanelMigrator:
             ssh_key=aapanel_cfg.get("ssh_key"),
             tmp_dir=migration_cfg.get("aapanel_tmp_dir", "/tmp/aapanel_migration"),
             local=aapanel_local,
+            mysql_root_password=aapanel_cfg.get("mysql_root_password", ""),
         )
 
         # Transfer manager
@@ -631,11 +632,19 @@ class HestiaToAAPanelMigrator:
                 result["site_id"] = site_id
                 log.info(f"Created site: {domain} → siteId={site_id}")
             except AAPanelAPIError as e:
-                existing = self.api.get_site_by_domain(domain)
-                if existing:
-                    site_id = existing.get("id")
-                    result["site_id"] = site_id
-                    log.warning(f"Site {domain} already exists (id={site_id}), reusing")
+                # Check if site already exists (either from API or error message)
+                err_msg = str(e).lower()
+                if "already exists" in err_msg:
+                    # Site was created in a previous run — try to find its ID
+                    existing = self.api.get_site_by_domain(domain)
+                    if existing:
+                        site_id = existing.get("id")
+                        result["site_id"] = site_id
+                        log.warning(f"Site {domain} already exists (id={site_id}), reusing")
+                    else:
+                        # Can't get ID but site exists — continue gracefully
+                        result["site_id"] = 0
+                        log.warning(f"Site {domain} already exists (could not get ID), continuing")
                 else:
                     result["error"] = f"AddSite failed: {e}"
                     return result
