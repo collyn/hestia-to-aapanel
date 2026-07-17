@@ -31,7 +31,7 @@ class DataTransformer:
             "8.3": "83",
             "8.4": "84",
         }
-        self.default_php = self.php_mapping.get("default", "81")
+        self.default_php = "81"  # PHP-81
         self.domain_map = domain_map or {}
         self.default_quota = default_quota
 
@@ -59,23 +59,24 @@ class DataTransformer:
             hestia_version: Detected version like '74', '8.1', '81', etc.
 
         Returns:
-            aaPanel PHP version string: '74', '80', '81', '82', '83', etc.
+            aaPanel PHP version string: 'PHP-74', 'PHP-80', 'PHP-81', etc.
         """
         version = hestia_version.strip()
 
-        # Already in aaPanel format (e.g., '74', '81')
-        if version.isdigit() and len(version) == 2:
+        # Already in aaPanel format with prefix (e.g., 'PHP-74')
+        if version.upper().startswith("PHP"):
             return version
 
-        # Convert '7.4' → '74'
+        # Convert '7.4' or '74' → 'PHP-74'
         if "." in version:
             parts = version.split(".")
-            mapped = f"{parts[0]}{parts[1]}"
-            if mapped.isdigit():
-                return mapped
+            numeric = f"{parts[0]}{parts[1]}"
+        elif version.isdigit() and len(version) == 2:
+            numeric = version
+        else:
+            numeric = self.php_mapping.get(version, self.default_php)
 
-        # Try predefined mapping
-        return self.php_mapping.get(version, self.default_php)
+        return f"PHP-{numeric}"
 
     # ------------------------------------------------------------------
     # Database credentials

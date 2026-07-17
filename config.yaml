@@ -79,7 +79,8 @@ migration:
   #   "old-domain.com": "new-domain.com"
 
 # --- PHP Version Mapping ---
-# Map Hestia PHP-FPM socket versions → aaPanel PHP version numbers
+# Map Hestia PHP-FPM socket versions → aaPanel PHP version identifiers
+# aaPanel format: PHP-74, PHP-80, PHP-81, PHP-82, PHP-83
 php_mapping:
   "7.4": "74"
   "8.0": "80"
@@ -87,7 +88,7 @@ php_mapping:
   "8.2": "82"
   "8.3": "83"
   "8.4": "84"
-  default: "81"  # Default PHP version if detection fails
+  default: "81"  # Default PHP version → PHP-81
 
 # --- DNS ---
 dns:

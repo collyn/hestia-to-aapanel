@@ -687,8 +687,18 @@ class HestiaToAAPanelMigrator:
                     continue
 
                 # Use ORIGINAL names/passwords from HestiaCP so websites work without reconfiguration
-                # Don't normalize — wp-config.php etc. reference the original names
-                db_password = db_pass or self.transformer._gen_password()
+                # Priority: db.conf → wp-config.php → .my.cnf → random (last resort)
+                db_password = db_pass
+                if not db_password:
+                    # Per-domain fallbacks (same logic as fix_db_passwords.py)
+                    self.hestia.connect()
+                    try:
+                        db_password = self.hestia._find_db_password(user, site["domain"]) or ""
+                    finally:
+                        self.hestia.disconnect()
+                if not db_password:
+                    db_password = self.transformer._gen_password()
+                    log.warning(f"Using generated password for {db_name} (no original found!)")
 
                 # Try aaPanel API first, fall back to direct MySQL
                 # Use ORIGINAL db_name, db_user, db_pass so CMS configs work unchanged

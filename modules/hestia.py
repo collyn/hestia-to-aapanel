@@ -292,18 +292,35 @@ class HestiaClient:
 
         if matched:
             log.info(f"Heuristic matched {len(matched)} DB(s) for {domain}: {[d.get('DATABASE','') for d in matched]}")
+            # Fill in missing passwords from per-domain sources
+            for db in matched:
+                if not db.get("PASSWORD"):
+                    db["PASSWORD"] = self._find_db_password(user, domain) or ""
             return matched
 
         # Fallback: return empty (site has no specific DB detected)
         log.debug(f"No DB matched for {domain}, returning empty")
         return []
-        """List all databases for a user."""
-        result = self.exec_json(f"{self.bin_path}/v-list-databases {user} json")
-        if isinstance(result, list):
-            return result
-        if isinstance(result, dict):
-            return [{"DATABASE": k, **v} for k, v in result.items()]
-        return []
+
+    def _find_db_password(self, user: str, domain: str) -> Optional[str]:
+        """Find DB password from per-domain config files (fallback)."""
+        # wp-config.php
+        wp_config = f"/home/{user}/web/{domain}/public_html/wp-config.php"
+        code, content, _ = self.exec(f"cat {wp_config} 2>/dev/null", warn_on_error=False)
+        if code == 0:
+            match = re.search(r"define\s*\(\s*'DB_PASSWORD'\s*,\s*'([^']+)'", content)
+            if match:
+                return match.group(1)
+
+        # .my.cnf
+        my_cnf = f"/home/{user}/web/{domain}/.my.cnf"
+        code, content, _ = self.exec(f"cat {my_cnf} 2>/dev/null", warn_on_error=False)
+        if code == 0:
+            match = re.search(r"password\s*=\s*(\S+)", content)
+            if match:
+                return match.group(1)
+
+        return None
 
     def get_dns_domains(self, user: str) -> List[str]:
         """List all DNS domains for a user."""
