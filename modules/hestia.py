@@ -245,7 +245,7 @@ class HestiaClient:
 
         return dbs
 
-    def get_databases_for_domain(self, user: str, domain: str) -> List[Dict[str, Any]]:
+    def get_databases_for_domain(self, user: str, domain: str, debug: bool = False) -> List[Dict[str, Any]]:
         """Find databases actually used by a specific domain.
 
         HestiaCP stores databases per-user, not per-domain. This method scans
@@ -253,9 +253,14 @@ class HestiaClient:
         """
         all_dbs = self.get_databases(user)
         if not all_dbs:
+            if debug:
+                log.warning(f"[DB DEBUG] {domain}: user '{user}' has 0 databases total")
             return []
 
         web_root = f"/home/{user}/web/{domain}/public_html"
+        if debug:
+            log.info(f"[DB DEBUG] {domain}: user={user}, total DBs={len(all_dbs)}: "
+                     f"{[d.get('DATABASE','') or d.get('DB','') for d in all_dbs]}")
 
         # Check multiple locations for wp-config.php (some setups move it up one level)
         wp_candidates = [
@@ -277,12 +282,16 @@ class HestiaClient:
             (f"{web_root}/configuration.php", r"\$db\s*=\s*'([^']+)'"),
         ])
 
+        config_found = False
         for config_path, pattern in config_checks:
             exit_code, content, _ = self.exec(
                 f"cat {config_path} 2>/dev/null", warn_on_error=False
             )
             if exit_code == 0 and content:
+                config_found = True
                 match = re.search(pattern, content)
+                if debug:
+                    log.info(f"[DB DEBUG] {domain}: found config {config_path}, regex={'match' if match else 'no match'}")
                 if match:
                     db_name = match.group(1)
                     # Find this DB in the all_dbs list
@@ -293,34 +302,48 @@ class HestiaClient:
                             return [db]
 
                     # DB name found in config but NOT in HestiaCP DB list
-                    # → create synthetic entry from config file credentials
-                    log.warning(f"DB '{db_name}' found in {config_path} but not in HestiaCP list — extracting from config")
-                    db_user = ""
-                    db_pass = ""
-                    db_host = "localhost"
+                    # → Verify it actually exists in MySQL before trusting it
+                    creds = self.get_mysql_admin_credentials()
+                    db_admin_user = creds.get("user", "root")
+                    db_admin_pass = creds.get("password", "")
+                    mysql_cmd = f"mysql -u{db_admin_user}"
+                    if db_admin_pass:
+                        mysql_cmd += f" -p'{db_admin_pass}'"
+                    exists_code, _, _ = self.exec(
+                        f"{mysql_cmd} -e 'USE `{db_name}`' 2>/dev/null", warn_on_error=False
+                    )
+                    if exists_code == 0:
+                        # DB exists in MySQL but was missing from HestiaCP list
+                        log.warning(f"DB '{db_name}' exists in MySQL but not in HestiaCP list — extracting from config")
+                        db_user = ""
+                        db_pass = ""
+                        db_host = "localhost"
 
-                    # Extract full credentials from wp-config.php
-                    user_match = re.search(r"define\s*\(\s*'DB_USER'\s*,\s*'([^']+)'", content)
-                    pass_match = re.search(r"define\s*\(\s*'DB_PASSWORD'\s*,\s*'([^']+)'", content)
-                    host_match = re.search(r"define\s*\(\s*'DB_HOST'\s*,\s*'([^']+)'", content)
+                        user_match = re.search(r"define\s*\(\s*'DB_USER'\s*,\s*'([^']+)'", content)
+                        pass_match = re.search(r"define\s*\(\s*'DB_PASSWORD'\s*,\s*'([^']+)'", content)
+                        host_match = re.search(r"define\s*\(\s*'DB_HOST'\s*,\s*'([^']+)'", content)
 
-                    if user_match:
-                        db_user = user_match.group(1)
-                    if pass_match:
-                        db_pass = pass_match.group(1)
-                    if host_match:
-                        db_host = host_match.group(1)
+                        if user_match:
+                            db_user = user_match.group(1)
+                        if pass_match:
+                            db_pass = pass_match.group(1)
+                        if host_match:
+                            db_host = host_match.group(1)
 
-                    log.info(f"Extracted from config: DB={db_name}, USER={db_user}, HOST={db_host}")
-                    return [{
-                        "DATABASE": db_name,
-                        "DB": db_name,
-                        "DBUSER": db_user,
-                        "PASSWORD": db_pass,
-                        "HOST": db_host,
-                        "TYPE": "mysql",
-                        "CHARSET": "utf8mb4",
-                    }]
+                        log.info(f"Extracted from config: DB={db_name}, USER={db_user}, HOST={db_host}")
+                        return [{
+                            "DATABASE": db_name,
+                            "DB": db_name,
+                            "DBUSER": db_user,
+                            "PASSWORD": db_pass,
+                            "HOST": db_host,
+                            "TYPE": "mysql",
+                            "CHARSET": "utf8mb4",
+                        }]
+                    else:
+                        # DB doesn't exist — wp-config.php might reference a different name
+                        # than what's actually in MySQL. Continue to heuristic.
+                        log.warning(f"DB '{db_name}' from config does not exist in MySQL — falling back to heuristic")
 
         # Heuristic: match by domain name parts in database name
         # Normalize both sides: strip non-alphanumeric for fuzzy matching
@@ -344,11 +367,18 @@ class HestiaClient:
                     break
 
         if matched:
+            if debug:
+                log.info(f"[DB DEBUG] {domain}: heuristic matched {len(matched)} DB(s): "
+                         f"{[(d.get('DATABASE',''), 'has_pass' if d.get('PASSWORD') else 'no_pass') for d in matched]}")
             log.info(f"Heuristic matched {len(matched)} DB(s) for {domain}: {[d.get('DATABASE','') for d in matched]}")
             for db in matched:
                 if not db.get("PASSWORD"):
                     db["PASSWORD"] = self._find_db_password(user, domain) or ""
             return matched
+
+        if debug:
+            log.warning(f"[DB DEBUG] {domain}: NO match found! config_found={config_found}, "
+                        f"all_dbs={len(all_dbs)}, domain_parts={domain_parts_raw}")
 
         # Last resort: if user has exactly 1 DB, assume it belongs to this domain
         if len(all_dbs) == 1:
