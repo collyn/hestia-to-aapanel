@@ -60,7 +60,7 @@ def main():
     ssh.connect()
 
     # WordPress rewrite template in aaPanel
-    WP_REWRITE_SRC = "/www/server/panel/rewrite/wordpress.conf"
+    WP_REWRITE_SRC = "/www/server/panel/rewrite/nginx/wordpress.conf"
     REWRITE_DIR = "/www/server/panel/vhost/rewrite"
 
     if not ssh.file_exists(WP_REWRITE_SRC):
