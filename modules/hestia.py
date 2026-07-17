@@ -282,23 +282,46 @@ class HestiaClient:
                             log.info(f"Matched DB {db_entry_name} → {domain} (via {config_path})")
                             return [db]
 
-        # Heuristic: match by domain name substring in database name
-        domain_key = domain.split(".")[0].replace("-", "_")
+        # Heuristic: match by domain name parts in database name
+        # Try multiple segments of the domain (e.g., "heras" from "heras.vn", "asahiland" from "asahiland.com")
+        domain_parts = set()
+        for part in domain.lower().replace("-", "_").split("."):
+            if len(part) >= 3 and part not in ("com", "vn", "net", "org", "biz", "info", "online"):
+                domain_parts.add(part)
+
         matched = []
         for db in all_dbs:
-            db_name = (db.get("DATABASE") or db.get("DB") or db.get("database", ""))
-            if domain_key in db_name.lower():
-                matched.append(db)
+            db_name = (db.get("DATABASE") or db.get("DB") or db.get("database", "")).lower()
+            for part in domain_parts:
+                if part in db_name:
+                    matched.append(db)
+                    break
 
         if matched:
             log.info(f"Heuristic matched {len(matched)} DB(s) for {domain}: {[d.get('DATABASE','') for d in matched]}")
-            # Fill in missing passwords from per-domain sources
             for db in matched:
                 if not db.get("PASSWORD"):
                     db["PASSWORD"] = self._find_db_password(user, domain) or ""
             return matched
 
-        # Fallback: return empty (site has no specific DB detected)
+        # Last resort: if user has exactly 1 DB, assume it belongs to this domain
+        if len(all_dbs) == 1:
+            db = all_dbs[0]
+            if not db.get("PASSWORD"):
+                db["PASSWORD"] = self._find_db_password(user, domain) or ""
+            log.info(f"Single DB user {user}: assigning {db.get('DATABASE','')} → {domain}")
+            return [db]
+
+        # Last resort: if site has wp-config.php but we couldn't match, return first DB
+        wp_check = f"{web_root}/wp-config.php"
+        code, _, _ = self.exec(f"test -f {wp_check}", warn_on_error=False)
+        if code == 0 and all_dbs:
+            db = all_dbs[0]
+            if not db.get("PASSWORD"):
+                db["PASSWORD"] = self._find_db_password(user, domain) or ""
+            log.warning(f"WordPress detected for {domain} but no DB matched — using {db.get('DATABASE','')}")
+            return [db]
+
         log.debug(f"No DB matched for {domain}, returning empty")
         return []
 
