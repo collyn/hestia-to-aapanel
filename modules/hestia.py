@@ -209,13 +209,41 @@ class HestiaClient:
         return self.exec_json(f"{self.bin_path}/v-list-web-domain {user} {domain} json")
 
     def get_databases(self, user: str) -> List[Dict[str, Any]]:
-        """List all databases for a user."""
+        """List all databases for a user.
+
+        HestiaCP CLI does NOT include passwords in JSON output for security.
+        We read passwords directly from the db.conf file.
+        """
         result = self.exec_json(f"{self.bin_path}/v-list-databases {user} json")
+        dbs: List[Dict[str, Any]] = []
         if isinstance(result, list):
-            return result
-        if isinstance(result, dict):
-            return [{"DATABASE": k, **v} for k, v in result.items()]
-        return []
+            dbs = result
+        elif isinstance(result, dict):
+            dbs = [{"DATABASE": k, **v} for k, v in result.items()]
+
+        # Read passwords from db.conf (CLI strips them)
+        db_conf = f"/usr/local/hestia/data/users/{user}/db.conf"
+        exit_code, content, _ = self.exec(f"cat {db_conf} 2>/dev/null", warn_on_error=False)
+        if exit_code == 0:
+            # Parse: DB='name' DBUSER='user' PASSWORD='pass' HOST='host' ...
+            for line in content.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                # Extract password
+                pw_match = re.search(r"PASSWORD='([^']*)'", line)
+                db_match = re.search(r"DB='([^']*)'", line)
+                if pw_match and db_match:
+                    db_name = db_match.group(1)
+                    password = pw_match.group(1)
+                    # Find matching DB entry and inject password
+                    for db_entry in dbs:
+                        entry_name = db_entry.get("DATABASE") or db_entry.get("DB", "")
+                        if entry_name == db_name:
+                            db_entry["PASSWORD"] = password
+                            break
+
+        return dbs
 
     def get_databases_for_domain(self, user: str, domain: str) -> List[Dict[str, Any]]:
         """Find databases actually used by a specific domain.
