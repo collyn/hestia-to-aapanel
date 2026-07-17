@@ -188,6 +188,37 @@ def main():
             ssh.exec(f"rm -f {sf}", warn_on_error=False)
             console.print(f"  [green]✓[/green] SQL" if code == 0 else f"  [yellow]⚠[/yellow] {err[:80]}")
 
+        # 5c. Fix paths in FILES (cache plugins hardcode absolute paths)
+        files_to_check = [
+            "wp-content/advanced-cache.php",
+            "wp-content/object-cache.php",
+            "wp-content/cache/",
+        ]
+        file_fixed = 0
+        for rel in files_to_check:
+            fpath = f"/www/wwwroot/{domain}/{rel}"
+            if ssh.file_exists(fpath):
+                # Replace old paths in this file (or all PHP files in cache dir)
+                if rel.endswith("/"):
+                    ssh.exec(
+                        f"grep -rl '{old_path}' {fpath} 2>/dev/null | "
+                        f"xargs -r sed -i 's|{old_path}|{new_path}|g' 2>/dev/null",
+                        warn_on_error=False,
+                    )
+                else:
+                    ssh.exec(f"sed -i 's|{old_path}|{new_path}|g' {fpath} 2>/dev/null", warn_on_error=False)
+                file_fixed += 1
+
+        # Also scan wp-content for any other PHP file with old paths
+        ssh.exec(
+            f"grep -rl '{old_path}' /www/wwwroot/{domain}/wp-content/ --include='*.php' 2>/dev/null | "
+            f"xargs -r sed -i 's|{old_path}|{new_path}|g' 2>/dev/null",
+            warn_on_error=False,
+        )
+
+        if file_fixed:
+            console.print(f"  [green]✓[/green] Files ({file_fixed} locations)")
+
         fixed += 1
 
     if fixed:
