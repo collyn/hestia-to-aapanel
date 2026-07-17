@@ -257,15 +257,25 @@ class HestiaClient:
 
         web_root = f"/home/{user}/web/{domain}/public_html"
 
-        # Known config files and their DB name patterns
-        config_checks = [
-            (f"{web_root}/wp-config.php", r"define\s*\(\s*'DB_NAME'\s*,\s*'([^']+)'"),
+        # Check multiple locations for wp-config.php (some setups move it up one level)
+        wp_candidates = [
+            f"{web_root}/wp-config.php",
+            f"/home/{user}/web/{domain}/wp-config.php",
+            f"{web_root}/wp/wp-config.php",
+        ]
+
+        # Known config files and their DB name patterns (with wp-config candidates)
+        config_checks = []
+        for wp_path in wp_candidates:
+            config_checks.append((wp_path, r"define\s*\(\s*'DB_NAME'\s*,\s*'([^']+)'"))
+
+        config_checks.extend([
             (f"{web_root}/.env", r"DB_DATABASE=(\S+)"),
             (f"{web_root}/config.php", r"'database'\s*=>\s*'([^']+)'"),
-            (f"{web_root}/app/etc/env.php", r"'dbname'\s*=>\s*'([^']+)'"),  # Magento
-            (f"{web_root}/sites/default/settings.php", r"'database'\s*=>\s*'([^']+)'"),  # Drupal
-            (f"{web_root}/configuration.php", r"\$db\s*=\s*'([^']+)'"),  # Joomla
-        ]
+            (f"{web_root}/app/etc/env.php", r"'dbname'\s*=>\s*'([^']+)'"),
+            (f"{web_root}/sites/default/settings.php", r"'database'\s*=>\s*'([^']+)'"),
+            (f"{web_root}/configuration.php", r"\$db\s*=\s*'([^']+)'"),
+        ])
 
         for config_path, pattern in config_checks:
             exit_code, content, _ = self.exec(
@@ -282,18 +292,54 @@ class HestiaClient:
                             log.info(f"Matched DB {db_entry_name} → {domain} (via {config_path})")
                             return [db]
 
+                    # DB name found in config but NOT in HestiaCP DB list
+                    # → create synthetic entry from config file credentials
+                    log.warning(f"DB '{db_name}' found in {config_path} but not in HestiaCP list — extracting from config")
+                    db_user = ""
+                    db_pass = ""
+                    db_host = "localhost"
+
+                    # Extract full credentials from wp-config.php
+                    user_match = re.search(r"define\s*\(\s*'DB_USER'\s*,\s*'([^']+)'", content)
+                    pass_match = re.search(r"define\s*\(\s*'DB_PASSWORD'\s*,\s*'([^']+)'", content)
+                    host_match = re.search(r"define\s*\(\s*'DB_HOST'\s*,\s*'([^']+)'", content)
+
+                    if user_match:
+                        db_user = user_match.group(1)
+                    if pass_match:
+                        db_pass = pass_match.group(1)
+                    if host_match:
+                        db_host = host_match.group(1)
+
+                    log.info(f"Extracted from config: DB={db_name}, USER={db_user}, HOST={db_host}")
+                    return [{
+                        "DATABASE": db_name,
+                        "DB": db_name,
+                        "DBUSER": db_user,
+                        "PASSWORD": db_pass,
+                        "HOST": db_host,
+                        "TYPE": "mysql",
+                        "CHARSET": "utf8mb4",
+                    }]
+
         # Heuristic: match by domain name parts in database name
-        # Try multiple segments of the domain (e.g., "heras" from "heras.vn", "asahiland" from "asahiland.com")
-        domain_parts = set()
-        for part in domain.lower().replace("-", "_").split("."):
-            if len(part) >= 3 and part not in ("com", "vn", "net", "org", "biz", "info", "online"):
-                domain_parts.add(part)
+        # Normalize both sides: strip non-alphanumeric for fuzzy matching
+        domain_parts_raw = set()
+        for part in domain.lower().split("."):
+            if len(part) >= 3 and part not in ("com", "vn", "net", "org", "biz", "info", "online", "gov", "edu"):
+                domain_parts_raw.add(part)
+                # Also without hyphens/underscores (e.g., "s-tech" → "stech", "asahi_lux" → "asahilux")
+                clean = re.sub(r'[^a-z0-9]', '', part)
+                if clean and clean != part:
+                    domain_parts_raw.add(clean)
 
         matched = []
         for db in all_dbs:
             db_name = (db.get("DATABASE") or db.get("DB") or db.get("database", "")).lower()
-            for part in domain_parts:
-                if part in db_name:
+            db_clean = re.sub(r'[^a-z0-9]', '', db_name)
+
+            for part in domain_parts_raw:
+                if part in db_name or part in db_clean:
                     matched.append(db)
                     break
 
